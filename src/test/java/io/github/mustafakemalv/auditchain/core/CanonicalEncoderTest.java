@@ -70,9 +70,10 @@ class CanonicalEncoderTest {
     }
 
     @Test
-    void differentTimestampNanosProduceDifferentBytes() {
-        AuditRecord first = new AuditRecord(1L, Instant.ofEpochSecond(100, 0), "a", "act", null, null, Map.of());
-        AuditRecord second = new AuditRecord(1L, Instant.ofEpochSecond(100, 1), "a", "act", null, null, Map.of());
+    void differentTimestampProducesDifferentBytes() {
+        // AuditRecord truncates to millis, so distinctness is at millisecond granularity
+        AuditRecord first = new AuditRecord(1L, Instant.ofEpochMilli(100), "a", "act", null, null, Map.of());
+        AuditRecord second = new AuditRecord(1L, Instant.ofEpochMilli(101), "a", "act", null, null, Map.of());
         assertThat(CanonicalEncoder.encode(first)).isNotEqualTo(CanonicalEncoder.encode(second));
     }
 

@@ -15,7 +15,6 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.time.Clock;
 import java.time.Instant;
-import java.time.temporal.ChronoUnit;
 import java.util.Optional;
 
 /**
@@ -66,7 +65,7 @@ public class AuditChain {
         ChainedRecord previous = store.last().orElse(null);
         long sequence = previous == null ? 0L : previous.record().sequence() + 1;
         String previousHash = previous == null ? GENESIS_PREVIOUS_HASH : previous.hash();
-        Instant timestamp = clock.instant().truncatedTo(ChronoUnit.MILLIS);
+        Instant timestamp = clock.instant(); // AuditRecord truncates to millis
         AuditRecord record = new AuditRecord(sequence, timestamp, event.actor(), event.action(),
                 event.resourceType(), event.resourceId(), event.details());
         String hash = computeHash(record, previousHash);
@@ -77,7 +76,7 @@ public class AuditChain {
 
     /**
      * Walks the chain from the start, recomputing each hash, and returns the first record that
-     * breaks it, or {@link VerificationResult#valid()} if the whole chain is intact.
+     * breaks it, or {@link VerificationResult#intact()} if the whole chain is intact.
      */
     public VerificationResult verify() {
         String expectedPreviousHash = GENESIS_PREVIOUS_HASH;

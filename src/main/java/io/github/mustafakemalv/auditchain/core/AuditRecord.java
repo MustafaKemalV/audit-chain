@@ -1,6 +1,7 @@
 package io.github.mustafakemalv.auditchain.core;
 
 import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -27,6 +28,10 @@ public record AuditRecord(
         if (action == null) {
             throw new IllegalArgumentException("action is required");
         }
+        // Truncate to millis here so the contract lives on the record itself, not only in
+        // AuditChain.append: the JDBC store persists epoch-millis, so sub-milli precision would not
+        // survive a round-trip and would fail verification.
+        timestamp = timestamp.truncatedTo(ChronoUnit.MILLIS);
         details = immutableCopy(details);
     }
 

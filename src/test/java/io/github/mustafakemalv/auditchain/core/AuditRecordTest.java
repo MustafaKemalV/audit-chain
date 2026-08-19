@@ -53,4 +53,11 @@ class AuditRecordTest {
         assertThatThrownBy(() -> record.details().put("x", "y"))
                 .isInstanceOf(UnsupportedOperationException.class);
     }
+
+    @Test
+    void timestampIsTruncatedToMilliseconds() {
+        Instant withNanos = Instant.ofEpochSecond(100, 123_456_789);
+        AuditRecord record = new AuditRecord(1L, withNanos, "a", "act", null, null, Map.of());
+        assertThat(record.timestamp()).isEqualTo(Instant.ofEpochSecond(100, 123_000_000));
+    }
 }
