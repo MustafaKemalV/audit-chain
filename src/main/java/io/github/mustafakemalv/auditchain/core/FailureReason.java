@@ -13,5 +13,8 @@ public enum FailureReason {
     BROKEN_LINK,
 
     /** A sequence number is missing or out of order (a record was removed or reordered). */
-    SEQUENCE_GAP
+    SEQUENCE_GAP,
+
+    /** The chain is internally consistent but does not match an externally anchored checkpoint. */
+    CHECKPOINT_MISMATCH
 }

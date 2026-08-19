@@ -4,6 +4,7 @@ import io.github.mustafakemalv.auditchain.core.AuditEvent;
 import io.github.mustafakemalv.auditchain.core.AuditRecord;
 import io.github.mustafakemalv.auditchain.core.CanonicalEncoder;
 import io.github.mustafakemalv.auditchain.core.ChainedRecord;
+import io.github.mustafakemalv.auditchain.core.Checkpoint;
 import io.github.mustafakemalv.auditchain.core.FailureReason;
 import io.github.mustafakemalv.auditchain.core.Hmac;
 import io.github.mustafakemalv.auditchain.core.VerificationResult;
@@ -15,6 +16,7 @@ import java.nio.charset.StandardCharsets;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
+import java.util.Optional;
 
 /**
  * Appends tamper-evident records to an {@link AuditStore} and verifies the chain. Each record is
@@ -98,6 +100,34 @@ public class AuditChain {
             expectedSequence = record.sequence() + 1;
         }
         return VerificationResult.intact();
+    }
+
+    /** The checkpoint (sequence + hash) of the current head, or empty if the chain has no records. */
+    public Optional<Checkpoint> head() {
+        return store.last().map(record -> new Checkpoint(record.record().sequence(), record.hash()));
+    }
+
+    /**
+     * Verifies the chain internally and then against an externally anchored {@code checkpoint}. This
+     * can catch a rewrite that {@link #verify()} cannot (for example one made with a stolen key),
+     * because the rewritten hash no longer matches the checkpoint that was anchored elsewhere.
+     */
+    public VerificationResult verifyAgainstCheckpoint(Checkpoint checkpoint) {
+        VerificationResult internal = verify();
+        if (!internal.valid()) {
+            return internal;
+        }
+        for (ChainedRecord chained : store.findAll()) {
+            if (chained.record().sequence() == checkpoint.sequence()) {
+                boolean matches = Hmac.constantTimeEquals(
+                        chained.hash().getBytes(StandardCharsets.UTF_8),
+                        checkpoint.hash().getBytes(StandardCharsets.UTF_8));
+                return matches
+                        ? VerificationResult.intact()
+                        : VerificationResult.broken(checkpoint.sequence(), FailureReason.CHECKPOINT_MISMATCH);
+            }
+        }
+        return VerificationResult.broken(checkpoint.sequence(), FailureReason.CHECKPOINT_MISMATCH);
     }
 
     private String computeHash(AuditRecord record, String previousHash) {

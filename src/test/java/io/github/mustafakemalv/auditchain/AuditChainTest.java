@@ -6,6 +6,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import io.github.mustafakemalv.auditchain.core.AuditEvent;
 import io.github.mustafakemalv.auditchain.core.AuditRecord;
 import io.github.mustafakemalv.auditchain.core.ChainedRecord;
+import io.github.mustafakemalv.auditchain.core.Checkpoint;
 import io.github.mustafakemalv.auditchain.core.FailureReason;
 import io.github.mustafakemalv.auditchain.core.VerificationResult;
 import io.github.mustafakemalv.auditchain.store.InMemoryAuditStore;
@@ -134,5 +135,46 @@ class AuditChainTest {
     void rejectsEmptyKey() {
         assertThatThrownBy(() -> new AuditChain(new byte[0], new InMemoryAuditStore()))
                 .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    void headIsEmptyForAnEmptyChain() {
+        assertThat(chainOver(new InMemoryAuditStore()).head()).isEmpty();
+    }
+
+    @Test
+    void headReturnsTheLastCheckpoint() {
+        InMemoryAuditStore store = storeWithThreeRecords();
+        Checkpoint head = chainOver(store).head().orElseThrow();
+        assertThat(head.sequence()).isEqualTo(2L);
+        assertThat(head.hash()).isEqualTo(store.findAll().get(2).hash());
+    }
+
+    @Test
+    void verifyAgainstMatchingCheckpointIsValid() {
+        AuditChain chain = chainOver(storeWithThreeRecords());
+        Checkpoint anchor = chain.head().orElseThrow();
+        assertThat(chain.verifyAgainstCheckpoint(anchor).valid()).isTrue();
+    }
+
+    @Test
+    void verifyAgainstCheckpointDetectsAKeyedRewrite() {
+        // anchor the original chain's head somewhere external
+        Checkpoint anchor = chainOver(storeWithThreeRecords()).head().orElseThrow();
+
+        // attacker rebuilds a DIFFERENT but internally-consistent chain with the SAME key
+        InMemoryAuditStore rewritten = new InMemoryAuditStore();
+        AuditChain rewrittenChain = chainOver(rewritten);
+        rewrittenChain.append(AuditEvent.of("alice", "login", "user", "1"));
+        rewrittenChain.append(new AuditEvent("bob", "delete", "doc", "2", Map.of("reason", "cleanup")));
+        rewrittenChain.append(AuditEvent.of("attacker", "update", "doc", "3")); // tampered content
+
+        // it verifies internally...
+        assertThat(rewrittenChain.verify().valid()).isTrue();
+        // ...but not against the externally anchored checkpoint
+        VerificationResult result = rewrittenChain.verifyAgainstCheckpoint(anchor);
+        assertThat(result.valid()).isFalse();
+        assertThat(result.reason()).isEqualTo(FailureReason.CHECKPOINT_MISMATCH);
+        assertThat(result.brokenSequence()).isEqualTo(2L);
     }
 }
