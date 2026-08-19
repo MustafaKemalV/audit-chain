@@ -177,4 +177,35 @@ class AuditChainTest {
         assertThat(result.reason()).isEqualTo(FailureReason.CHECKPOINT_MISMATCH);
         assertThat(result.brokenSequence()).isEqualTo(2L);
     }
+
+    @Test
+    void verifyAgainstCheckpointReportsTheInternalFailureFirst() {
+        // an internally broken chain reports its own failure, before looking at the checkpoint
+        List<ChainedRecord> good = storeWithThreeRecords().findAll();
+        InMemoryAuditStore tampered = new InMemoryAuditStore();
+        tampered.append(good.get(0));
+        tampered.append(good.get(2)); // sequence 1 removed
+        Checkpoint anchor = new Checkpoint(2L, good.get(2).hash());
+
+        assertThat(chainOver(tampered).verifyAgainstCheckpoint(anchor).reason())
+                .isEqualTo(FailureReason.SEQUENCE_GAP);
+    }
+
+    @Test
+    void verifyAgainstCheckpointDetectsAMissingAnchoredRecord() {
+        // the chain is internally valid, but the anchored sequence is not in it
+        AuditChain chain = chainOver(storeWithThreeRecords());
+        Checkpoint anchor = new Checkpoint(99L, "0".repeat(64));
+
+        VerificationResult result = chain.verifyAgainstCheckpoint(anchor);
+        assertThat(result.valid()).isFalse();
+        assertThat(result.reason()).isEqualTo(FailureReason.CHECKPOINT_MISMATCH);
+        assertThat(result.brokenSequence()).isEqualTo(99L);
+    }
+
+    @Test
+    void checkpointRejectsNullHash() {
+        assertThatThrownBy(() -> new Checkpoint(0L, null))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
 }
