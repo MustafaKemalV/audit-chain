@@ -8,6 +8,9 @@ import io.github.mustafakemalv.auditchain.core.FailureReason;
 import io.github.mustafakemalv.auditchain.core.Hmac;
 import io.github.mustafakemalv.auditchain.core.VerificationResult;
 import io.github.mustafakemalv.auditchain.store.AuditStore;
+import java.io.ByteArrayOutputStream;
+import java.io.DataOutputStream;
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.time.Clock;
 import java.time.Instant;
@@ -99,10 +102,27 @@ public class AuditChain {
 
     private String computeHash(AuditRecord record, String previousHash) {
         byte[] canonical = CanonicalEncoder.encode(record);
+        return Hmac.hex(Hmac.sha256(key, chainMessage(canonical, previousHash)));
+    }
+
+    /**
+     * Builds the message that gets hashed by length-prefixing both parts. Prefixing makes the
+     * boundary between the record bytes and the previous hash explicit, so no (record, previousHash)
+     * pair can ever be re-split into a different pair with the same bytes. This holds without relying
+     * on the previous hash always being a fixed width.
+     */
+    private byte[] chainMessage(byte[] canonical, String previousHash) {
         byte[] previousHashBytes = previousHash.getBytes(StandardCharsets.UTF_8);
-        byte[] message = new byte[canonical.length + previousHashBytes.length];
-        System.arraycopy(canonical, 0, message, 0, canonical.length);
-        System.arraycopy(previousHashBytes, 0, message, canonical.length, previousHashBytes.length);
-        return Hmac.hex(Hmac.sha256(key, message));
+        ByteArrayOutputStream buffer =
+                new ByteArrayOutputStream(canonical.length + previousHashBytes.length + 8);
+        try (DataOutputStream out = new DataOutputStream(buffer)) {
+            out.writeInt(canonical.length);
+            out.write(canonical);
+            out.writeInt(previousHashBytes.length);
+            out.write(previousHashBytes);
+        } catch (IOException e) {
+            throw new IllegalStateException("Encoding to an in-memory buffer cannot fail", e);
+        }
+        return buffer.toByteArray();
     }
 }
