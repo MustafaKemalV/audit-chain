@@ -1,6 +1,8 @@
 package io.github.mustafakemalv.auditchain.autoconfigure;
 
 import io.github.mustafakemalv.auditchain.AuditChain;
+import io.github.mustafakemalv.auditchain.aop.AuditActorProvider;
+import io.github.mustafakemalv.auditchain.aop.AuditedAspect;
 import io.github.mustafakemalv.auditchain.store.AuditStore;
 import io.github.mustafakemalv.auditchain.store.InMemoryAuditStore;
 import io.github.mustafakemalv.auditchain.store.JdbcAuditStore;
@@ -47,6 +49,18 @@ public class AuditChainAutoConfiguration {
     @ConditionalOnMissingBean
     AuditChain auditChain(AuditChainProperties properties, AuditStore auditStore) {
         return new AuditChain(decodeKey(properties.getHmacKey()), auditStore);
+    }
+
+    @Bean
+    @ConditionalOnMissingBean
+    AuditActorProvider auditActorProvider() {
+        return () -> "system";
+    }
+
+    @Bean
+    @ConditionalOnMissingBean
+    AuditedAspect auditedAspect(AuditChain auditChain, AuditActorProvider actorProvider) {
+        return new AuditedAspect(auditChain, actorProvider);
     }
 
     private static byte[] decodeKey(String hmacKey) {
