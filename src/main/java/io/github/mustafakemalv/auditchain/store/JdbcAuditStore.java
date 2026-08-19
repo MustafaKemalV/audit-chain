@@ -22,6 +22,7 @@ import org.springframework.jdbc.core.RowMapper;
 public class JdbcAuditStore implements AuditStore {
 
     private static final Pattern SAFE_TABLE_NAME = Pattern.compile("^[A-Za-z_][A-Za-z0-9_]*$");
+    private static final int MAX_DETAILS_LENGTH = 4000;
 
     private static final RowMapper<ChainedRecord> ROW_MAPPER = (rs, rowNum) -> {
         AuditRecord record = new AuditRecord(
@@ -54,6 +55,13 @@ public class JdbcAuditStore implements AuditStore {
     @Override
     public void append(ChainedRecord record) {
         AuditRecord r = record.record();
+        String encodedDetails = DetailsCodec.encode(r.details());
+        // Fail fast instead of letting a non-strict database silently truncate the column, which
+        // would make the stored bytes no longer decode to the hashed map and corrupt the chain.
+        if (encodedDetails.length() > MAX_DETAILS_LENGTH) {
+            throw new IllegalArgumentException(
+                    "encoded details exceed the " + MAX_DETAILS_LENGTH + "-character column limit");
+        }
         jdbcTemplate.update(
                 "INSERT INTO " + tableName + " (sequence, timestamp_ms, actor, action, resource_type,"
                         + " resource_id, details, previous_hash, hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -63,7 +71,7 @@ public class JdbcAuditStore implements AuditStore {
                 r.action(),
                 r.resourceType(),
                 r.resourceId(),
-                DetailsCodec.encode(r.details()),
+                encodedDetails,
                 record.previousHash(),
                 record.hash());
     }

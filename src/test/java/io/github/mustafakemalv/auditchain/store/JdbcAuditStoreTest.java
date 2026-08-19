@@ -101,4 +101,13 @@ class JdbcAuditStoreTest {
         assertThat(result.reason()).isEqualTo(FailureReason.SEQUENCE_GAP);
         assertThat(result.brokenSequence()).isEqualTo(2L);
     }
+
+    @Test
+    void rejectsOversizedDetails() {
+        String big = "x".repeat(5000);
+        AuditChain chain = newChain();
+        assertThatThrownBy(() ->
+                chain.append(new AuditEvent("a", "act", null, null, Map.of("blob", big))))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
 }
