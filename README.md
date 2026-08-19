@@ -157,6 +157,16 @@ defence beyond keyless tamper-evidence, the library gives you hooks, not guarant
 - **`verify()` reads the whole chain** into memory. For very large logs, verify in batches (planned).
 - **The chain starts at sequence 0** and is a single monotonic run; log rotation/archival is not
   supported yet.
+- **`@Audited` records after the method returns, not inside its transaction.** If the surrounding
+  transaction rolls back after a normal return, the record is still written; if the audit write
+  itself fails, the action goes unrecorded. When the audit write must share the business
+  transaction's fate, call the imperative `append(...)` inside that transaction. `@Audited` also
+  records no `details` (use `append(...)` for contextual key/values).
+- **`details` has a size limit.** The encoded map must fit the `details` column (4000 chars by
+  default); the JDBC store rejects oversized details rather than letting the database truncate them
+  and corrupt the chain. On databases that treat the empty string as `NULL` (Oracle), a `""` field
+  would round-trip as `null` and fail verification; use a database that distinguishes them, or avoid
+  empty-string fields.
 
 ## License
 
