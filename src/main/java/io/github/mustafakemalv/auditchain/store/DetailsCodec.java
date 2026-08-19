@@ -45,6 +45,9 @@ public final class DetailsCodec {
         Map<String, String> details = new LinkedHashMap<>();
         try (DataInputStream in = new DataInputStream(new ByteArrayInputStream(bytes))) {
             int count = in.readInt();
+            if (count < 0 || count > in.available()) {
+                throw new IOException("invalid entry count: " + count);
+            }
             for (int i = 0; i < count; i++) {
                 String key = readString(in);
                 String value = readString(in);
@@ -70,6 +73,9 @@ public final class DetailsCodec {
         int length = in.readInt();
         if (length == NULL_MARKER) {
             return null;
+        }
+        if (length < 0 || length > in.available()) {
+            throw new IOException("invalid string length: " + length);
         }
         byte[] bytes = new byte[length];
         in.readFully(bytes);

@@ -1,7 +1,11 @@
 package io.github.mustafakemalv.auditchain.store;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import java.io.ByteArrayOutputStream;
+import java.io.DataOutputStream;
+import java.util.Base64;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import org.junit.jupiter.api.Test;
@@ -47,5 +51,45 @@ class DetailsCodecTest {
         shuffled.put("a", "1");
 
         assertThat(DetailsCodec.encode(ordered)).isEqualTo(DetailsCodec.encode(shuffled));
+    }
+
+    @Test
+    void decodeRejectsInvalidBase64() {
+        assertThatThrownBy(() -> DetailsCodec.decode("not valid base64 !!!"))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    void decodeRejectsTruncatedPayload() {
+        // valid base64 but too few bytes to even read the entry count
+        String truncated = Base64.getEncoder().encodeToString(new byte[] {0x00});
+        assertThatThrownBy(() -> DetailsCodec.decode(truncated))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    void decodeRejectsNegativeLength() throws Exception {
+        // one entry whose key length is a bogus negative value (not the -1 null marker)
+        ByteArrayOutputStream buffer = new ByteArrayOutputStream();
+        try (DataOutputStream out = new DataOutputStream(buffer)) {
+            out.writeInt(1);
+            out.writeInt(-5);
+        }
+        String payload = Base64.getEncoder().encodeToString(buffer.toByteArray());
+        assertThatThrownBy(() -> DetailsCodec.decode(payload))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    void decodeRejectsLengthBeyondPayload() throws Exception {
+        // one entry whose key length is far larger than the remaining bytes
+        ByteArrayOutputStream buffer = new ByteArrayOutputStream();
+        try (DataOutputStream out = new DataOutputStream(buffer)) {
+            out.writeInt(1);
+            out.writeInt(1_000_000);
+        }
+        String payload = Base64.getEncoder().encodeToString(buffer.toByteArray());
+        assertThatThrownBy(() -> DetailsCodec.decode(payload))
+                .isInstanceOf(IllegalArgumentException.class);
     }
 }
