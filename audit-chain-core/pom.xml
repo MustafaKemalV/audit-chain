@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>io.github.mustafakemalv</groupId>
+        <artifactId>audit-chain-parent</artifactId>
+        <version>0.1.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>audit-chain-core</artifactId>
+
+    <name>audit-chain-core</name>
+    <description>Dependency-free core of audit-chain: HMAC-SHA256 hash chain, deterministic canonical
+        encoding, and the append-only AuditStore SPI. Usable without Spring.</description>
+    <url>https://github.com/MustafaKemalV/audit-chain</url>
+
+    <!-- No compile dependencies on purpose. This module must stay usable from plain Java,
+         Quarkus or Micronaut; anything that needs a third-party library belongs in a
+         sub-package of another module (see store.jdbc in the autoconfigure module). -->
+    <dependencies>
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.assertj</groupId>
+            <artifactId>assertj-core</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+</project>

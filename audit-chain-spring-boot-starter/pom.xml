@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>io.github.mustafakemalv</groupId>
+        <artifactId>audit-chain-parent</artifactId>
+        <version>0.1.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>audit-chain-spring-boot-starter</artifactId>
+
+    <name>audit-chain-spring-boot-starter</name>
+    <description>Starter for audit-chain: add this one dependency to get a tamper-evident,
+        append-only audit log auto-configured in a Spring Boot application.</description>
+    <url>https://github.com/MustafaKemalV/audit-chain</url>
+
+    <!-- A starter carries no code of its own; it only pulls in what an application needs. -->
+    <dependencies>
+        <dependency>
+            <groupId>io.github.mustafakemalv</groupId>
+            <artifactId>audit-chain-spring-boot-autoconfigure</artifactId>
+        </dependency>
+    </dependencies>
+</project>

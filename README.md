@@ -66,7 +66,7 @@ manager). If no key is set, the application fails fast at startup.
 ### 2. Create the table
 
 With a `DataSource` present, audit-chain uses a JDBC append-only store. Create the table from
-[`schema.sql`](src/main/resources/audit-chain/schema.sql) (via Flyway/Liquibase or by hand). To make
+[`schema.sql`](audit-chain-spring-boot-autoconfigure/src/main/resources/audit-chain/schema.sql) (via Flyway/Liquibase or by hand). To make
 append-only a real guarantee, grant the audit DB role `INSERT` and `SELECT` but **not** `UPDATE` or
 `DELETE`. Without a `DataSource`, audit-chain falls back to an in-memory store (dev only; it logs a
 warning and does not survive a restart).
