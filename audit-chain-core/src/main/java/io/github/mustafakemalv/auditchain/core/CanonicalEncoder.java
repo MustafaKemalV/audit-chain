@@ -19,18 +19,52 @@ import java.util.Map;
  * <p>Nullable string fields distinguish {@code null} (length {@code -1}) from the empty string
  * (length {@code 0}). Map entries are written in sorted-key order so iteration order never affects
  * the result. The chain link (previous hash) is applied by the chain, not encoded here.
+ *
+ * <p>The first field written is the format version. It is there so the encoding can ever change:
+ * without it, adding a field or reordering one would silently produce different bytes for the same
+ * record, every already-stored hash would stop matching, and nothing would tell a reader whether a
+ * given row was written by the old layout or the new one. With it, records carry the version they
+ * were written under and can still be verified after the format moves on.
  */
 public final class CanonicalEncoder {
+
+    /**
+     * The encoding version this build writes. Bump it whenever the byte layout below changes in any
+     * way: a new field, a different order, a different width. Records already stored keep their own
+     * version and stay verifiable.
+     */
+    public static final int CURRENT_FORMAT_VERSION = 1;
 
     private static final int NULL_MARKER = -1;
 
     private CanonicalEncoder() {
     }
 
-    /** Encodes {@code record} to its canonical byte representation. */
-    public static byte[] encode(AuditRecord record) {
+    /**
+     * Encodes {@code record} to its canonical byte representation under a given format version.
+     *
+     * @param record the record to encode
+     * @param formatVersion the layout version to write, normally {@link #CURRENT_FORMAT_VERSION};
+     *     verification passes the version the record was stored with
+     * @return the canonical bytes
+     * @throws IllegalArgumentException if the record is null or the version is not one this build
+     *     knows how to write
+     */
+    public static byte[] encode(AuditRecord record, int formatVersion) {
+        if (record == null) {
+            throw new IllegalArgumentException("record is required");
+        }
+        if (formatVersion != CURRENT_FORMAT_VERSION) {
+            // Refuse rather than guess. Producing bytes under a layout this build does not implement
+            // would compute a hash that means nothing and report it as a mismatch, which reads as
+            // tampering.
+            throw new IllegalArgumentException(
+                    "unsupported format version " + formatVersion + "; this build writes "
+                            + CURRENT_FORMAT_VERSION);
+        }
         ByteArrayOutputStream buffer = new ByteArrayOutputStream();
         try (DataOutputStream out = new DataOutputStream(buffer)) {
+            out.writeInt(formatVersion);
             out.writeLong(record.sequence());
             Instant timestamp = record.timestamp();
             out.writeLong(timestamp.getEpochSecond());

@@ -22,8 +22,9 @@ import org.springframework.jdbc.core.JdbcTemplate;
  * Auto-configures an {@link AuditChain}. If the application defines no {@link AuditStore}, one is
  * chosen automatically: a {@link JdbcAuditStore} when a {@link DataSource} is present, otherwise an
  * {@link InMemoryAuditStore} (with a warning, since that does not survive a restart). The HMAC key is
- * read from {@code audit-chain.hmac-key} (base64). The whole configuration backs off when
- * {@code audit-chain.enabled=false}.
+ * read from {@code audit-chain.hmac-key} (base64), and the chain identity from
+ * {@code audit-chain.chain-id}, which defaults to the table name. The whole configuration backs off
+ * when {@code audit-chain.enabled=false}.
  */
 @AutoConfiguration
 @ConditionalOnProperty(prefix = "audit-chain", name = "enabled", havingValue = "true", matchIfMissing = true)
@@ -48,7 +49,7 @@ public class AuditChainAutoConfiguration {
     @Bean
     @ConditionalOnMissingBean
     AuditChain auditChain(AuditChainProperties properties, AuditStore auditStore) {
-        return new AuditChain(decodeKey(properties.getHmacKey()), auditStore);
+        return new AuditChain(decodeKey(properties.getHmacKey()), auditStore, properties.resolveChainId());
     }
 
     @Bean

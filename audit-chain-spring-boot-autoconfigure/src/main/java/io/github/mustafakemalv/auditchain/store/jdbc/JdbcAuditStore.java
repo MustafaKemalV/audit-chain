@@ -47,7 +47,11 @@ public class JdbcAuditStore implements AuditStore {
                 rs.getString("resource_type"),
                 rs.getString("resource_id"),
                 DetailsCodec.decode(rs.getString("details")));
-        return new ChainedRecord(record, rs.getString("previous_hash"), rs.getString("hash"));
+        return new ChainedRecord(
+                record,
+                rs.getString("previous_hash"),
+                rs.getString("hash"),
+                rs.getInt("format_version"));
     };
 
     private final JdbcTemplate jdbcTemplate;
@@ -86,9 +90,11 @@ public class JdbcAuditStore implements AuditStore {
         }
         try {
             jdbcTemplate.update(
-                    "INSERT INTO " + tableName + " (sequence, timestamp_ms, actor, action, resource_type,"
-                            + " resource_id, details, previous_hash, hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO " + tableName + " (sequence, format_version, timestamp_ms, actor,"
+                            + " action, resource_type, resource_id, details, previous_hash, hash)"
+                            + " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     r.sequence(),
+                    record.formatVersion(),
                     r.timestamp().toEpochMilli(),
                     r.actor(),
                     r.action(),

@@ -4,6 +4,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import io.github.mustafakemalv.auditchain.core.AuditEvent;
+import io.github.mustafakemalv.auditchain.core.CanonicalEncoder;
 import io.github.mustafakemalv.auditchain.core.AuditRecord;
 import io.github.mustafakemalv.auditchain.core.ChainedRecord;
 import io.github.mustafakemalv.auditchain.core.Checkpoint;
@@ -27,7 +28,7 @@ class AuditChainTest {
     private static final Clock CLOCK = Clock.fixed(Instant.parse("2026-08-19T10:00:00Z"), ZoneOffset.UTC);
 
     private static AuditChain chainOver(AuditStore store) {
-        return new AuditChain(KEY, store, CLOCK);
+        return new AuditChain(KEY, store, AuditChain.DEFAULT_CHAIN_ID, CLOCK);
     }
 
     private static InMemoryAuditStore storeWithThreeRecords() {
@@ -243,5 +244,69 @@ class AuditChainTest {
     void checkpointRejectsNullHash() {
         assertThatThrownBy(() -> new Checkpoint(0L, null))
                 .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    void recordsCannotBeMovedIntoAnotherChainSealedWithTheSameKey() {
+        // One key covering several logs is the natural multi-tenant setup. Without a chain identity
+        // in the hash, a genuine, correctly signed history from one tenant verified perfectly inside
+        // another tenant's log, so an incriminating trail could simply be replaced with someone
+        // else's.
+        InMemoryAuditStore tenantA = new InMemoryAuditStore();
+        AuditChain chainA = new AuditChain(KEY, tenantA, "tenant-a", CLOCK);
+        chainA.append(AuditEvent.of("alice", "invoice.approve"));
+        chainA.append(AuditEvent.of("alice", "invoice.approve"));
+        assertThat(chainA.verify().valid()).isTrue();
+
+        TamperedStore tenantB = new TamperedStore();
+        AuditChain chainB = new AuditChain(KEY, tenantB, "tenant-b", CLOCK);
+        tenantA.findAll().forEach(tenantB::append);
+
+        VerificationResult result = chainB.verify();
+        assertThat(result.valid()).isFalse();
+        assertThat(result.reason()).isEqualTo(FailureReason.HASH_MISMATCH);
+        assertThat(result.brokenSequence()).isZero();
+    }
+
+    @Test
+    void theSameEventUnderTwoChainIdsProducesDifferentHashes() {
+        InMemoryAuditStore first = new InMemoryAuditStore();
+        InMemoryAuditStore second = new InMemoryAuditStore();
+        ChainedRecord a = new AuditChain(KEY, first, "chain-one", CLOCK)
+                .append(AuditEvent.of("alice", "login"));
+        ChainedRecord b = new AuditChain(KEY, second, "chain-two", CLOCK)
+                .append(AuditEvent.of("alice", "login"));
+
+        assertThat(a.record()).isEqualTo(b.record());
+        assertThat(a.hash()).isNotEqualTo(b.hash());
+    }
+
+    @Test
+    void rejectsAnEmptyChainId() {
+        assertThatThrownBy(() -> new AuditChain(KEY, new InMemoryAuditStore(), ""))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> new AuditChain(KEY, new InMemoryAuditStore(), null))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    void appendedRecordsCarryTheFormatVersionTheyWereSealedUnder() {
+        InMemoryAuditStore store = new InMemoryAuditStore();
+        ChainedRecord record = chainOver(store).append(AuditEvent.of("alice", "login"));
+
+        assertThat(record.formatVersion()).isEqualTo(CanonicalEncoder.CURRENT_FORMAT_VERSION);
+    }
+
+    @Test
+    void aRecordClaimingAnUnknownFormatVersionIsNotSilentlyAccepted() {
+        // A row whose version this build cannot write must not be hashed under a guessed layout.
+        List<ChainedRecord> good = storeWithThreeRecords().findAll();
+        ChainedRecord first = good.get(0);
+        TamperedStore store = new TamperedStore();
+        store.append(new ChainedRecord(first.record(), first.previousHash(), first.hash(), 99));
+
+        assertThatThrownBy(() -> chainOver(store).verify())
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("unsupported format version");
     }
 }

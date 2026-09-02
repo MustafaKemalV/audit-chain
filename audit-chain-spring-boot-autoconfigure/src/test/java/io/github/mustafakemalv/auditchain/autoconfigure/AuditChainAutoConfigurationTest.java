@@ -77,4 +77,29 @@ class AuditChainAutoConfigurationTest {
             return new InMemoryAuditStore();
         }
     }
+
+    @Test
+    void chainIdDefaultsToTheTableName() {
+        // Two logs under one key are kept apart with no configuration at all, because a separate
+        // table already means a separate chain.
+        runner.withPropertyValues("audit-chain.hmac-key=" + KEY_B64, "audit-chain.table-name=payments_audit")
+                .run(context -> assertThat(context.getBean(AuditChain.class).chainId())
+                        .isEqualTo("payments_audit"));
+    }
+
+    @Test
+    void chainIdCanBeSetExplicitly() {
+        runner.withPropertyValues("audit-chain.hmac-key=" + KEY_B64, "audit-chain.chain-id=eu-tenant-7")
+                .run(context -> assertThat(context.getBean(AuditChain.class).chainId())
+                        .isEqualTo("eu-tenant-7"));
+    }
+
+    @Test
+    void anExplicitChainIdWinsOverTheTableName() {
+        runner.withPropertyValues("audit-chain.hmac-key=" + KEY_B64,
+                        "audit-chain.table-name=payments_audit",
+                        "audit-chain.chain-id=eu-tenant-7")
+                .run(context -> assertThat(context.getBean(AuditChain.class).chainId())
+                        .isEqualTo("eu-tenant-7"));
+    }
 }

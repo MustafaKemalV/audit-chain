@@ -15,6 +15,14 @@ public class AuditChainProperties {
     /** Name of the append-only table used by the JDBC store. */
     private String tableName = "audit_chain";
 
+    /**
+     * Identity bound into every hash, so records cannot be moved between chains sealed with the same
+     * key. Defaults to the table name, which keeps two tables under one key apart without any
+     * configuration. Set it explicitly when one key covers several logs, and never reuse an id
+     * across logs.
+     */
+    private String chainId;
+
     public boolean isEnabled() {
         return enabled;
     }
@@ -37,5 +45,22 @@ public class AuditChainProperties {
 
     public void setTableName(String tableName) {
         this.tableName = tableName;
+    }
+
+    public String getChainId() {
+        return chainId;
+    }
+
+    public void setChainId(String chainId) {
+        this.chainId = chainId;
+    }
+
+    /**
+     * The configured chain id, or the table name when none was set.
+     *
+     * @return the identity to bind into this chain's hashes
+     */
+    public String resolveChainId() {
+        return chainId == null || chainId.isBlank() ? tableName : chainId.strip();
     }
 }
