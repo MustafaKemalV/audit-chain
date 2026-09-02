@@ -18,11 +18,28 @@ pinpoints exactly where it broke.
 - **Pluggable `AuditStore` SPI:** append-only JDBC store and an in-memory store, or bring your own.
 - **External anchoring hook:** export a `Checkpoint` and later `verifyAgainstCheckpoint(...)` to
   catch even a stolen-key rewrite.
+- **Usable without Spring:** the chain itself lives in `audit-chain-core`, which has no compile
+  dependencies at all. The Spring Boot wiring sits in separate artifacts on top of it.
 
 ## Requirements
 
-- Java 25
-- Spring Boot 4.1
+- **Java 25.** This is a deliberate choice, not a technical necessity: the sources compile on 17.
+  It means consumers on JDK 17 or 21 cannot use these artifacts, and Spring Boot 4.1 itself
+  baselines on 17, so this library is stricter than the framework it targets.
+- **Spring Boot 4.1**, for the starter and the auto-configuration only. `audit-chain-core` needs
+  neither Spring nor a database.
+
+## Modules
+
+| Artifact | What it gives you | Dependencies |
+| --- | --- | --- |
+| `audit-chain-core` | The hash chain, canonical encoding, the `AuditStore` SPI and an in-memory store | none |
+| `audit-chain-spring-boot-autoconfigure` | The JDBC store, the `@Audited` aspect, the properties | core, Spring, AspectJ |
+| `audit-chain-spring-boot-starter` | Everything wired up for a Boot application | the autoconfigure module |
+
+Use the starter in a Spring Boot application. Reach for `audit-chain-core` on its own when you want
+the chain in plain Java, or in a framework other than Spring, and intend to write your own
+`AuditStore`.
 
 ## Installation
 
@@ -34,12 +51,22 @@ cd audit-chain
 mvn install
 ```
 
-Then add the dependency:
+Then add the starter:
 
 ```xml
 <dependency>
     <groupId>io.github.mustafakemalv</groupId>
     <artifactId>audit-chain-spring-boot-starter</artifactId>
+    <version>0.1.0-SNAPSHOT</version>
+</dependency>
+```
+
+Or, for the chain alone with no Spring on the classpath:
+
+```xml
+<dependency>
+    <groupId>io.github.mustafakemalv</groupId>
+    <artifactId>audit-chain-core</artifactId>
     <version>0.1.0-SNAPSHOT</version>
 </dependency>
 ```
