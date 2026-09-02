@@ -56,7 +56,7 @@ class DetailsCodecTest {
     @Test
     void decodeRejectsInvalidBase64() {
         assertThatThrownBy(() -> DetailsCodec.decode("not valid base64 !!!"))
-                .isInstanceOf(IllegalArgumentException.class);
+                .isInstanceOf(MalformedRecordException.class);
     }
 
     @Test
@@ -64,7 +64,7 @@ class DetailsCodecTest {
         // valid base64 but too few bytes to even read the entry count
         String truncated = Base64.getEncoder().encodeToString(new byte[] {0x00});
         assertThatThrownBy(() -> DetailsCodec.decode(truncated))
-                .isInstanceOf(IllegalArgumentException.class);
+                .isInstanceOf(MalformedRecordException.class);
     }
 
     @Test
@@ -77,7 +77,7 @@ class DetailsCodecTest {
         }
         String payload = Base64.getEncoder().encodeToString(buffer.toByteArray());
         assertThatThrownBy(() -> DetailsCodec.decode(payload))
-                .isInstanceOf(IllegalArgumentException.class);
+                .isInstanceOf(MalformedRecordException.class);
     }
 
     @Test
@@ -90,6 +90,26 @@ class DetailsCodecTest {
         }
         String payload = Base64.getEncoder().encodeToString(buffer.toByteArray());
         assertThatThrownBy(() -> DetailsCodec.decode(payload))
-                .isInstanceOf(IllegalArgumentException.class);
+                .isInstanceOf(MalformedRecordException.class);
+    }
+
+    @Test
+    void decodeRejectsNullPayload() {
+        // A database that turns the empty string into NULL (Oracle) reaches decode as null;
+        // it must be reported as a corrupt record, not as a NullPointerException.
+        assertThatThrownBy(() -> DetailsCodec.decode(null))
+                .isInstanceOf(MalformedRecordException.class);
+    }
+
+    @Test
+    void everyRejectionPathRaisesTheSameType() {
+        // The point of MalformedRecordException is that a caller reading a row back can handle
+        // "this record is corrupt" with a single catch, whatever shape the corruption takes.
+        assertThatThrownBy(() -> DetailsCodec.decode(null))
+                .isInstanceOf(MalformedRecordException.class);
+        assertThatThrownBy(() -> DetailsCodec.decode("not-base64!!!"))
+                .isInstanceOf(MalformedRecordException.class);
+        assertThatThrownBy(() -> DetailsCodec.decode(Base64.getEncoder().encodeToString(new byte[] {0, 0})))
+                .isInstanceOf(MalformedRecordException.class);
     }
 }

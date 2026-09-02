@@ -3,11 +3,14 @@ package io.github.mustafakemalv.auditchain.store.jdbc;
 import io.github.mustafakemalv.auditchain.core.AuditRecord;
 import io.github.mustafakemalv.auditchain.core.ChainedRecord;
 import io.github.mustafakemalv.auditchain.store.AuditStore;
+import io.github.mustafakemalv.auditchain.store.AuditStoreException;
 import io.github.mustafakemalv.auditchain.store.DetailsCodec;
+import java.sql.PreparedStatement;
 import java.time.Instant;
 import java.util.List;
 import java.util.Optional;
 import java.util.regex.Pattern;
+import org.springframework.dao.DataAccessException;
 import org.springframework.dao.EmptyResultDataAccessException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
@@ -20,6 +23,15 @@ import org.springframework.jdbc.core.RowMapper;
  * <p>The timestamp is stored as epoch milliseconds so it round-trips exactly (the chain truncates
  * timestamps to milliseconds when appending), and the details map is stored in one column via
  * {@link DetailsCodec}.
+ *
+ * <p>Unique sequence numbers, which the SPI requires and the chain depends on, come from the primary
+ * key on the sequence column in the shipped schema. A concurrent append that loses the race is
+ * rejected by that constraint and surfaces as {@link AuditStoreException} rather than forking the
+ * chain.
+ *
+ * <p>This class is stateless and safe to share between threads. It takes part in whatever
+ * transaction the calling thread already has, because {@code JdbcTemplate} uses the connection bound
+ * to that transaction: an append made inside a business transaction commits and rolls back with it.
  */
 public class JdbcAuditStore implements AuditStore {
 
@@ -41,6 +53,14 @@ public class JdbcAuditStore implements AuditStore {
     private final JdbcTemplate jdbcTemplate;
     private final String tableName;
 
+    /**
+     * Creates a store over {@code tableName}.
+     *
+     * @param jdbcTemplate the template to run statements through
+     * @param tableName the audit table, which must be a plain identifier
+     * @throws IllegalArgumentException if the template is null or the table name is not a plain
+     *     identifier
+     */
     public JdbcAuditStore(JdbcTemplate jdbcTemplate, String tableName) {
         if (jdbcTemplate == null) {
             throw new IllegalArgumentException("jdbcTemplate is required");
@@ -64,18 +84,24 @@ public class JdbcAuditStore implements AuditStore {
             throw new IllegalArgumentException(
                     "encoded details exceed the " + MAX_DETAILS_LENGTH + "-character column limit");
         }
-        jdbcTemplate.update(
-                "INSERT INTO " + tableName + " (sequence, timestamp_ms, actor, action, resource_type,"
-                        + " resource_id, details, previous_hash, hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                r.sequence(),
-                r.timestamp().toEpochMilli(),
-                r.actor(),
-                r.action(),
-                r.resourceType(),
-                r.resourceId(),
-                encodedDetails,
-                record.previousHash(),
-                record.hash());
+        try {
+            jdbcTemplate.update(
+                    "INSERT INTO " + tableName + " (sequence, timestamp_ms, actor, action, resource_type,"
+                            + " resource_id, details, previous_hash, hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    r.sequence(),
+                    r.timestamp().toEpochMilli(),
+                    r.actor(),
+                    r.action(),
+                    r.resourceType(),
+                    r.resourceId(),
+                    encodedDetails,
+                    record.previousHash(),
+                    record.hash());
+        } catch (DataAccessException e) {
+            // Includes the duplicate-sequence case: two appends raced and this one lost. The SPI
+            // requires that to be an error rather than a second record on the same sequence.
+            throw new AuditStoreException("could not append audit record " + r.sequence(), e);
+        }
     }
 
     @Override
@@ -88,17 +114,48 @@ public class JdbcAuditStore implements AuditStore {
             return Optional.ofNullable(record);
         } catch (EmptyResultDataAccessException e) {
             return Optional.empty();
+        } catch (DataAccessException e) {
+            throw new AuditStoreException("could not read the head of the audit chain", e);
         }
     }
 
     @Override
     public List<ChainedRecord> findAll() {
-        return jdbcTemplate.query("SELECT * FROM " + tableName + " ORDER BY sequence ASC", ROW_MAPPER);
+        try {
+            return jdbcTemplate.query("SELECT * FROM " + tableName + " ORDER BY sequence ASC", ROW_MAPPER);
+        } catch (DataAccessException e) {
+            throw new AuditStoreException("could not read the audit chain", e);
+        }
+    }
+
+    @Override
+    public List<ChainedRecord> findRange(long fromSequence, int limit) {
+        if (limit <= 0) {
+            throw new IllegalArgumentException("limit must be positive");
+        }
+        // setMaxRows rather than a LIMIT clause: the row-limiting syntax differs between databases
+        // (LIMIT on MySQL, FETCH FIRST on Oracle), while setMaxRows is plain JDBC and works on all
+        // of them.
+        String sql = "SELECT * FROM " + tableName + " WHERE sequence >= ? ORDER BY sequence ASC";
+        try {
+            return jdbcTemplate.query(connection -> {
+                PreparedStatement statement = connection.prepareStatement(sql);
+                statement.setLong(1, fromSequence);
+                statement.setMaxRows(limit);
+                return statement;
+            }, ROW_MAPPER);
+        } catch (DataAccessException e) {
+            throw new AuditStoreException("could not read the audit chain from sequence " + fromSequence, e);
+        }
     }
 
     @Override
     public long count() {
-        Long count = jdbcTemplate.queryForObject("SELECT COUNT(*) FROM " + tableName, Long.class);
-        return count == null ? 0L : count;
+        try {
+            Long count = jdbcTemplate.queryForObject("SELECT COUNT(*) FROM " + tableName, Long.class);
+            return count == null ? 0L : count;
+        } catch (DataAccessException e) {
+            throw new AuditStoreException("could not count the audit records", e);
+        }
     }
 }

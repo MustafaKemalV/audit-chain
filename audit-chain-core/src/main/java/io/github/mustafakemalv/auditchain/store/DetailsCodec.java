@@ -39,9 +39,27 @@ public final class DetailsCodec {
         return Base64.getEncoder().encodeToString(buffer.toByteArray());
     }
 
-    /** Decodes a string produced by {@link #encode(Map)} back into a details map. */
+    /**
+     * Decodes a string produced by {@link #encode(Map)} back into a details map.
+     *
+     * @param encoded the stored payload
+     * @return the details map it was produced from
+     * @throws MalformedRecordException if the payload is null, is not valid base64, or does not
+     *     decode to a well-formed map. Every rejection path raises this one type, so a caller
+     *     reading a row back can tell "this record is corrupt" from "the database is unreachable".
+     */
     public static Map<String, String> decode(String encoded) {
-        byte[] bytes = Base64.getDecoder().decode(encoded);
+        if (encoded == null) {
+            throw new MalformedRecordException("details payload is null");
+        }
+        byte[] bytes;
+        try {
+            bytes = Base64.getDecoder().decode(encoded);
+        } catch (IllegalArgumentException e) {
+            // Base64 rejects outside the try below, so without this the JDK's own
+            // IllegalArgumentException would escape and callers could not handle it uniformly.
+            throw new MalformedRecordException("details payload is not valid base64", e);
+        }
         Map<String, String> details = new LinkedHashMap<>();
         try (DataInputStream in = new DataInputStream(new ByteArrayInputStream(bytes))) {
             int count = in.readInt();
@@ -54,7 +72,7 @@ public final class DetailsCodec {
                 details.put(key, value);
             }
         } catch (IOException e) {
-            throw new IllegalArgumentException("Malformed details payload", e);
+            throw new MalformedRecordException("Malformed details payload", e);
         }
         return details;
     }

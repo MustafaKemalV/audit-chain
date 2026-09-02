@@ -5,11 +5,16 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import io.github.mustafakemalv.auditchain.AuditChain;
 import io.github.mustafakemalv.auditchain.core.AuditEvent;
+import io.github.mustafakemalv.auditchain.core.ChainedRecord;
 import io.github.mustafakemalv.auditchain.core.FailureReason;
 import io.github.mustafakemalv.auditchain.core.VerificationResult;
 import io.github.mustafakemalv.auditchain.store.AuditStore;
+import io.github.mustafakemalv.auditchain.store.AuditStoreException;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
+import java.util.stream.LongStream;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -110,5 +115,83 @@ class JdbcAuditStoreTest {
         assertThatThrownBy(() ->
                 chain.append(new AuditEvent("a", "act", null, null, Map.of("blob", big))))
                 .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    void findRangeReturnsASliceInSequenceOrder() {
+        AuditChain chain = newChain();
+        for (int i = 0; i < 10; i++) {
+            chain.append(AuditEvent.of("alice", "act." + i));
+        }
+
+        List<ChainedRecord> slice = store.findRange(3L, 4);
+
+        assertThat(slice).hasSize(4);
+        assertThat(slice.stream().map(r -> r.record().sequence()).toList())
+                .containsExactly(3L, 4L, 5L, 6L);
+    }
+
+    @Test
+    void findRangeStopsAtTheEndOfTheChain() {
+        AuditChain chain = newChain();
+        chain.append(AuditEvent.of("alice", "only"));
+
+        assertThat(store.findRange(0L, 100)).hasSize(1);
+        assertThat(store.findRange(5L, 100)).isEmpty();
+    }
+
+    @Test
+    void findRangeWalksTheWholeChainInBatches() {
+        // This is the batched verification path the SPI exists to allow: read a page, remember the
+        // next sequence, read the next page, never holding the whole log at once.
+        AuditChain chain = newChain();
+        for (int i = 0; i < 25; i++) {
+            chain.append(AuditEvent.of("alice", "act." + i));
+        }
+
+        List<Long> walked = new ArrayList<>();
+        long from = 0L;
+        while (true) {
+            List<ChainedRecord> page = store.findRange(from, 7);
+            if (page.isEmpty()) {
+                break;
+            }
+            page.forEach(r -> walked.add(r.record().sequence()));
+            from = page.get(page.size() - 1).record().sequence() + 1;
+        }
+
+        assertThat(walked).hasSize(25);
+        assertThat(walked).isEqualTo(LongStream.range(0, 25).boxed().toList());
+    }
+
+    @Test
+    void findRangeRejectsANonPositiveLimit() {
+        assertThatThrownBy(() -> store.findRange(0L, 0))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    void aDatabaseFailureSurfacesAsAnAuditStoreException() {
+        // The SPI promises callers a single exception type; a caller must not have to catch
+        // Spring's DataAccessException to handle a failed audit write.
+        AuditChain chain = newChain();
+        chain.append(AuditEvent.of("alice", "login"));
+        jdbcTemplate.execute("DROP TABLE audit_chain");
+
+        assertThatThrownBy(() -> store.findAll()).isInstanceOf(AuditStoreException.class);
+        assertThatThrownBy(() -> store.count()).isInstanceOf(AuditStoreException.class);
+        assertThatThrownBy(() -> store.last()).isInstanceOf(AuditStoreException.class);
+        assertThatThrownBy(() -> store.findRange(0L, 10)).isInstanceOf(AuditStoreException.class);
+    }
+
+    @Test
+    void aDuplicateSequenceIsRejectedRatherThanForkingTheChain() {
+        // The chain's whole anti-fork guarantee rests on the store refusing a repeated sequence.
+        AuditChain chain = newChain();
+        ChainedRecord first = chain.append(AuditEvent.of("alice", "login"));
+
+        assertThatThrownBy(() -> store.append(first))
+                .isInstanceOf(AuditStoreException.class);
+        assertThat(store.count()).isEqualTo(1L);
     }
 }

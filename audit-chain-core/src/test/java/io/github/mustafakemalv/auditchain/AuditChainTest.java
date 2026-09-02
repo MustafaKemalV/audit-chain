@@ -9,13 +9,16 @@ import io.github.mustafakemalv.auditchain.core.ChainedRecord;
 import io.github.mustafakemalv.auditchain.core.Checkpoint;
 import io.github.mustafakemalv.auditchain.core.FailureReason;
 import io.github.mustafakemalv.auditchain.core.VerificationResult;
+import io.github.mustafakemalv.auditchain.store.AuditStore;
 import io.github.mustafakemalv.auditchain.store.InMemoryAuditStore;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import org.junit.jupiter.api.Test;
 
 class AuditChainTest {
@@ -23,7 +26,7 @@ class AuditChainTest {
     private static final byte[] KEY = "an-audit-hmac-key".getBytes(StandardCharsets.UTF_8);
     private static final Clock CLOCK = Clock.fixed(Instant.parse("2026-08-19T10:00:00Z"), ZoneOffset.UTC);
 
-    private static AuditChain chainOver(InMemoryAuditStore store) {
+    private static AuditChain chainOver(AuditStore store) {
         return new AuditChain(KEY, store, CLOCK);
     }
 
@@ -120,7 +123,11 @@ class AuditChainTest {
     @Test
     void reorderedRecordsAreDetected() {
         List<ChainedRecord> good = storeWithThreeRecords().findAll();
-        InMemoryAuditStore store = new InMemoryAuditStore();
+        // Reordering has to be staged through a store with no integrity checks: the real stores
+        // refuse a sequence that does not move forward, so an attacker cannot reorder the log
+        // through them. In production the same tampering happens below the store, straight against
+        // the database, which is what this stand-in represents.
+        TamperedStore store = new TamperedStore();
         store.append(good.get(0));
         store.append(good.get(2));
         store.append(good.get(1));
@@ -129,6 +136,35 @@ class AuditChainTest {
         assertThat(result.valid()).isFalse();
         // the record now in position 1 has sequence 2, but sequence 1 is expected
         assertThat(result.brokenSequence()).isEqualTo(2L);
+    }
+
+    /**
+     * A store that accepts whatever it is handed, standing in for someone writing directly to the
+     * database. Used to stage tampering that the real stores would refuse at the front door.
+     */
+    private static final class TamperedStore implements AuditStore {
+
+        private final List<ChainedRecord> records = new ArrayList<>();
+
+        @Override
+        public void append(ChainedRecord record) {
+            records.add(record);
+        }
+
+        @Override
+        public Optional<ChainedRecord> last() {
+            return records.isEmpty() ? Optional.empty() : Optional.of(records.get(records.size() - 1));
+        }
+
+        @Override
+        public List<ChainedRecord> findAll() {
+            return new ArrayList<>(records);
+        }
+
+        @Override
+        public long count() {
+            return records.size();
+        }
     }
 
     @Test
