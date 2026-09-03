@@ -62,6 +62,43 @@
         </plugins>
     </build>
 
+    <profiles>
+        <!--
+            Mutation testing, run on demand with -Pmutation. In a library whose whole claim is that
+            tampering is detectable, "which production line can I delete with the tests still green"
+            is a security question, not a style one. Kept out of the default build because it is slow.
+        -->
+        <profile>
+            <id>mutation</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.pitest</groupId>
+                        <artifactId>pitest-maven</artifactId>
+                        <version>1.20.4</version>
+                        <configuration>
+                            <targetClasses>
+                                <param>io.github.mustafakemalv.auditchain.*</param>
+                            </targetClasses>
+                            <timestampedReports>false</timestampedReports>
+                            <outputFormats>
+                                <param>HTML</param>
+                                <param>CSV</param>
+                            </outputFormats>
+                        </configuration>
+                        <dependencies>
+                            <dependency>
+                                <groupId>org.pitest</groupId>
+                                <artifactId>pitest-junit5-plugin</artifactId>
+                                <version>1.2.3</version>
+                            </dependency>
+                        </dependencies>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
+
     <dependencyManagement>
         <dependencies>
             <dependency>

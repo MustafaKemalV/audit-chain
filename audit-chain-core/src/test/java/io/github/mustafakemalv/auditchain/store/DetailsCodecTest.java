@@ -112,4 +112,32 @@ class DetailsCodecTest {
         assertThatThrownBy(() -> DetailsCodec.decode(Base64.getEncoder().encodeToString(new byte[] {0, 0})))
                 .isInstanceOf(MalformedRecordException.class);
     }
+
+    @Test
+    void aStringThatExactlyFillsThePayloadIsAccepted() {
+        // Boundary between "the length fits" and "the length runs past the end". Mutation testing
+        // found that relaxing this check from > to >= changed nothing any test could see, which
+        // meant the legitimate case sitting right on the boundary was never exercised.
+        Map<String, String> details = new LinkedHashMap<>();
+        details.put("k", "v");
+
+        assertThat(DetailsCodec.decode(DetailsCodec.encode(details))).isEqualTo(details);
+
+        Map<String, String> longer = new LinkedHashMap<>();
+        longer.put("key", "a".repeat(64));
+        assertThat(DetailsCodec.decode(DetailsCodec.encode(longer))).isEqualTo(longer);
+    }
+
+    @Test
+    void aLengthOneByteBeyondThePayloadIsRejected() throws Exception {
+        ByteArrayOutputStream buffer = new ByteArrayOutputStream();
+        try (DataOutputStream out = new DataOutputStream(buffer)) {
+            out.writeInt(1);      // one entry
+            out.writeInt(3);      // a key of three bytes
+            out.write(new byte[] {'a', 'b'});   // but only two are here
+        }
+
+        assertThatThrownBy(() -> DetailsCodec.decode(Base64.getEncoder().encodeToString(buffer.toByteArray())))
+                .isInstanceOf(MalformedRecordException.class);
+    }
 }
