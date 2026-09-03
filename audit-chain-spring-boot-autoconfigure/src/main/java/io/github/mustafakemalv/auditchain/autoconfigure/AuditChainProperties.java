@@ -1,5 +1,6 @@
 package io.github.mustafakemalv.auditchain.autoconfigure;
 
+import io.github.mustafakemalv.auditchain.aop.AuditedAspect;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 
 /** Binds {@code audit-chain.*} configuration. */
@@ -23,6 +24,20 @@ public class AuditChainProperties {
      */
     private String chainId;
 
+    /**
+     * Which DataSource bean the JDBC store should use. Only needed when the application defines more
+     * than one; with a single DataSource it is picked up automatically.
+     */
+    private String dataSourceBeanName;
+
+    /**
+     * What an {@code @Audited} method does when the audit write itself fails: FAIL lets the failure
+     * reach the caller and take the business operation with it, LOG records the problem and lets the
+     * operation succeed unrecorded. FAIL is the default because an audit log with silent holes is
+     * hard to trust.
+     */
+    private AuditedAspect.FailureMode onFailure = AuditedAspect.FailureMode.FAIL;
+
     public boolean isEnabled() {
         return enabled;
     }
@@ -45,6 +60,22 @@ public class AuditChainProperties {
 
     public void setTableName(String tableName) {
         this.tableName = tableName;
+    }
+
+    public AuditedAspect.FailureMode getOnFailure() {
+        return onFailure;
+    }
+
+    public void setOnFailure(AuditedAspect.FailureMode onFailure) {
+        this.onFailure = onFailure;
+    }
+
+    public String getDataSourceBeanName() {
+        return dataSourceBeanName;
+    }
+
+    public void setDataSourceBeanName(String dataSourceBeanName) {
+        this.dataSourceBeanName = dataSourceBeanName;
     }
 
     public String getChainId() {

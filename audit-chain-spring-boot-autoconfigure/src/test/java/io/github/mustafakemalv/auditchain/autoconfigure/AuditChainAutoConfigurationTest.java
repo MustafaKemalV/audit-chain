@@ -13,6 +13,7 @@ import org.springframework.boot.autoconfigure.AutoConfigurations;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Primary;
 import org.springframework.jdbc.datasource.embedded.EmbeddedDatabaseBuilder;
 import org.springframework.jdbc.datasource.embedded.EmbeddedDatabaseType;
 
@@ -101,5 +102,76 @@ class AuditChainAutoConfigurationTest {
                         "audit-chain.chain-id=eu-tenant-7")
                 .run(context -> assertThat(context.getBean(AuditChain.class).chainId())
                         .isEqualTo("eu-tenant-7"));
+    }
+
+    @Test
+    void twoDataSourcesWithoutAChoiceFailWithAnActionableMessage() {
+        // Adding this starter used to make a primary-plus-replica application unable to start, with
+        // a NoUniqueBeanDefinitionException that named neither the starter nor the fix.
+        runner.withUserConfiguration(TwoDataSourceConfig.class)
+                .withPropertyValues("audit-chain.hmac-key=" + KEY_B64)
+                .run(context -> {
+                    assertThat(context).hasFailed();
+                    assertThat(context.getStartupFailure())
+                            .hasRootCauseMessage("audit-chain: several DataSource beans are defined and"
+                                    + " none is marked @Primary, so it is not clear which one holds the"
+                                    + " audit table. Set audit-chain.datasource-bean-name to choose one.");
+                });
+    }
+
+    @Test
+    void twoDataSourcesWorkOnceOneIsNamed() {
+        runner.withUserConfiguration(TwoDataSourceConfig.class)
+                .withPropertyValues("audit-chain.hmac-key=" + KEY_B64,
+                        "audit-chain.datasource-bean-name=auditDataSource")
+                .run(context -> {
+                    assertThat(context).hasSingleBean(AuditChain.class);
+                    assertThat(context).getBean(AuditStore.class).isInstanceOf(JdbcAuditStore.class);
+                });
+    }
+
+    @Test
+    void aPrimaryDataSourceIsPickedWithoutConfiguration() {
+        runner.withUserConfiguration(PrimaryDataSourceConfig.class)
+                .withPropertyValues("audit-chain.hmac-key=" + KEY_B64)
+                .run(context -> assertThat(context).getBean(AuditStore.class)
+                        .isInstanceOf(JdbcAuditStore.class));
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    static class TwoDataSourceConfig {
+
+        @Bean
+        DataSource auditDataSource() {
+            return embedded();
+        }
+
+        @Bean
+        DataSource reportingDataSource() {
+            return embedded();
+        }
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    static class PrimaryDataSourceConfig {
+
+        @Bean
+        @Primary
+        DataSource auditDataSource() {
+            return embedded();
+        }
+
+        @Bean
+        DataSource reportingDataSource() {
+            return embedded();
+        }
+    }
+
+    private static DataSource embedded() {
+        return new EmbeddedDatabaseBuilder()
+                .setType(EmbeddedDatabaseType.H2)
+                .generateUniqueName(true)
+                .addScript("classpath:audit-chain/schema.sql")
+                .build();
     }
 }

@@ -10,6 +10,7 @@ import java.util.Base64;
 import javax.sql.DataSource;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
+import org.springframework.beans.factory.BeanFactory;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.boot.autoconfigure.AutoConfiguration;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
@@ -36,14 +37,36 @@ public class AuditChainAutoConfiguration {
 
     @Bean
     @ConditionalOnMissingBean(AuditStore.class)
-    AuditStore auditStore(AuditChainProperties properties, ObjectProvider<DataSource> dataSource) {
-        DataSource resolved = dataSource.getIfAvailable();
+    AuditStore auditStore(AuditChainProperties properties, ObjectProvider<DataSource> dataSources,
+            BeanFactory beanFactory) {
+        DataSource resolved = resolveDataSource(properties, dataSources, beanFactory);
         if (resolved != null) {
             return new JdbcAuditStore(new JdbcTemplate(resolved), properties.getTableName());
         }
         log.warn("audit-chain: no DataSource found, falling back to an in-memory store. Records will "
                 + "NOT survive a restart; configure a DataSource for durable auditing.");
         return new InMemoryAuditStore();
+    }
+
+    private static DataSource resolveDataSource(AuditChainProperties properties,
+            ObjectProvider<DataSource> dataSources, BeanFactory beanFactory) {
+        String configured = properties.getDataSourceBeanName();
+        if (configured != null && !configured.isBlank()) {
+            return beanFactory.getBean(configured.strip(), DataSource.class);
+        }
+        DataSource unique = dataSources.getIfUnique();
+        if (unique != null) {
+            return unique;
+        }
+        if (dataSources.stream().findAny().isPresent()) {
+            // Several candidates and no instruction. Falling back to the in-memory store here would
+            // start the application with an audit log that quietly does not survive a restart, which
+            // is worse than not starting at all.
+            throw new IllegalStateException("audit-chain: several DataSource beans are defined and none "
+                    + "is marked @Primary, so it is not clear which one holds the audit table. Set "
+                    + "audit-chain.datasource-bean-name to choose one.");
+        }
+        return null;
     }
 
     @Bean
@@ -60,8 +83,9 @@ public class AuditChainAutoConfiguration {
 
     @Bean
     @ConditionalOnMissingBean
-    AuditedAspect auditedAspect(AuditChain auditChain, AuditActorProvider actorProvider) {
-        return new AuditedAspect(auditChain, actorProvider);
+    AuditedAspect auditedAspect(AuditChain auditChain, AuditActorProvider actorProvider,
+            AuditChainProperties properties) {
+        return new AuditedAspect(auditChain, actorProvider, properties.getOnFailure());
     }
 
     private static byte[] decodeKey(String hmacKey) {
