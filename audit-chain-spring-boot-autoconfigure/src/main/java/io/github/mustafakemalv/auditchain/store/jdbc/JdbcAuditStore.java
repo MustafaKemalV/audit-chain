@@ -73,6 +73,8 @@ public class JdbcAuditStore implements AuditStore {
     private final TransactionTemplate transactionTemplate;
     /** Used when the caller's transaction cannot accept a write; see {@link #appendSealed}. */
     private final TransactionTemplate independentTransactionTemplate;
+    /** Set once the tip row is known to exist; see {@link #ensureHeadRowExists()}. */
+    private volatile boolean headRowExists;
 
     /**
      * Creates a store over {@code tableName}.
@@ -152,6 +154,7 @@ public class JdbcAuditStore implements AuditStore {
         if (sealer == null) {
             throw new IllegalArgumentException("sealer is required");
         }
+        ensureHeadRowExists();
         // A read-only transaction cannot carry this write at all: the database refuses both the row
         // lock and the insert. Auditing a read ("who viewed this record") is a normal thing to want,
         // so the write goes into its own transaction rather than failing. It could not share the
@@ -177,6 +180,7 @@ public class JdbcAuditStore implements AuditStore {
         if (sealer == null) {
             throw new IllegalArgumentException("sealer is required");
         }
+        ensureHeadRowExists();
         return independentTransactionTemplate.execute(status -> sealAndInsert(sealer));
     }
 
@@ -237,7 +241,7 @@ public class JdbcAuditStore implements AuditStore {
         } catch (DataAccessException e) {
             // Includes the duplicate-sequence case: two appends raced and this one lost. The SPI
             // requires that to be an error rather than a second record on the same sequence.
-            throw new AuditStoreException("could not append audit record " + r.sequence(), e);
+            throw new AuditStoreException(describeAppendFailure(r.sequence()), e);
         }
     }
 
@@ -246,6 +250,46 @@ public class JdbcAuditStore implements AuditStore {
             throw new IllegalArgumentException(field + " is " + value.length() + " characters, above the "
                     + MAX_STRING_LENGTH + "-character column limit");
         }
+    }
+
+    /**
+     * Creates this chain's tip row if it is not there yet, so the row lock has something to take.
+     *
+     * <p>The shipped schema seeds a row for the default table name, but the table name is
+     * configurable, so any other chain would start without one. A lock on nothing takes nothing, and
+     * the first appends on such a chain raced each other exactly as they did before the tip existed.
+     *
+     * <p>Written as INSERT ... WHERE NOT EXISTS rather than an UPSERT because the UPSERT syntax
+     * differs across databases, and because a single statement is safe against two writers arriving
+     * together: one inserts, the other matches nothing and moves on.
+     */
+    private void ensureHeadRowExists() {
+        if (headRowExists) {
+            return;
+        }
+        synchronized (this) {
+            if (headRowExists) {
+                return;
+            }
+            try {
+                // In a transaction of its own, and before the caller's begins. Inside the append
+                // transaction two writers cannot see each other's uncommitted insert, so both would
+                // try and one would lose the whole append to a duplicate key.
+                independentTransactionTemplate.executeWithoutResult(status -> insertHeadRow());
+            } catch (DataAccessException e) {
+                // Another process created it between our check and our insert, which is the outcome
+                // we wanted anyway.
+            }
+            headRowExists = true;
+        }
+    }
+
+    private void insertHeadRow() {
+        jdbcTemplate.update(
+                "INSERT INTO " + headTableName + " (chain_table, last_sequence, last_hash,"
+                        + " record_count, updated_ms) SELECT ?, ?, ?, ?, ?"
+                        + " WHERE NOT EXISTS (SELECT 1 FROM " + headTableName + " WHERE chain_table = ?)",
+                tableName, -1L, ChainHead.GENESIS_HASH, 0L, System.currentTimeMillis(), tableName);
     }
 
     @Override
@@ -315,6 +359,20 @@ public class JdbcAuditStore implements AuditStore {
         } catch (DataAccessException e) {
             throw new AuditStoreException("could not read the audit chain from sequence " + fromSequence, e);
         }
+    }
+
+    /**
+     * Explains a rejected append. A lost race and a tip row that has fallen behind the table produce
+     * the same constraint violation, but the second repeats forever and stops the chain, so the
+     * message names it rather than letting it look like ordinary contention.
+     */
+    private String describeAppendFailure(long sequence) {
+        // Deliberately no diagnostic query: a failed insert has usually left the transaction unable
+        // to run one, so asking would only produce a second, less useful error.
+        return "could not append audit record " + sequence
+                + ". If this repeats for the same sequence, the " + headTableName + " row for "
+                + tableName + " has fallen behind the records and every append will keep colliding"
+                + " until it is set past the table's highest sequence.";
     }
 
     @Override

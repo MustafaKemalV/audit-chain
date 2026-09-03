@@ -26,6 +26,15 @@ public enum FailureReason {
     TRUNCATED,
 
     /**
+     * The chain's stored tip contradicts the records themselves, most plainly when the tip is gone
+     * while records remain. That combination is never a fresh chain; it is a deleted tip row, a
+     * restore of one table without the other, or a migration that ran on a chain that already had
+     * history. It matters because the tip is what remembers how long the chain has been, so a chain
+     * that has lost it can no longer show that records were removed from the end.
+     */
+    CHAIN_HEAD_MISMATCH,
+
+    /**
      * A stored record could not be read back into its original shape. Treated as a break rather than
      * an error, because unreadable bytes in an audit row are what tampering looks like.
      */

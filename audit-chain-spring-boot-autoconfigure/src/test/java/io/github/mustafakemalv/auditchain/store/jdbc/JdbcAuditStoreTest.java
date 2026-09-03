@@ -6,6 +6,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import io.github.mustafakemalv.auditchain.AuditChain;
 import io.github.mustafakemalv.auditchain.core.AuditEvent;
 import io.github.mustafakemalv.auditchain.core.ChainedRecord;
+import io.github.mustafakemalv.auditchain.core.Checkpoint;
 import io.github.mustafakemalv.auditchain.core.FailureReason;
 import io.github.mustafakemalv.auditchain.core.VerificationResult;
 import io.github.mustafakemalv.auditchain.store.AuditStore;
@@ -367,5 +368,83 @@ class JdbcAuditStoreTest {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
+    }
+
+    @Test
+    void deletingTheTipRowIsReportedRatherThanHidingTheDeletion() {
+        // Removing the tip row used to disable the truncation check silently, so deleting it along
+        // with the records produced a clean bill of health. Records with no tip is never a fresh
+        // chain, and the two sources contradicting each other is free to detect.
+        AuditChain chain = newChain();
+        for (int i = 0; i < 5; i++) {
+            chain.append(AuditEvent.of("alice", "act." + i));
+        }
+        jdbcTemplate.update("DELETE FROM audit_chain WHERE sequence >= 3");
+        assertThat(chain.verify().reason()).isEqualTo(FailureReason.TRUNCATED);
+
+        jdbcTemplate.update("DELETE FROM audit_chain_head");
+
+        VerificationResult result = chain.verify();
+        assertThat(result.valid()).isFalse();
+        assertThat(result.reason()).isEqualTo(FailureReason.CHAIN_HEAD_MISMATCH);
+        assertThat(store.count()).as("the records are still there").isEqualTo(3L);
+    }
+
+    @Test
+    void theExportedCheckpointComesFromARecordNotFromTheTipRow() {
+        // Anchoring what the tip claims would let anyone who can write to it choose what gets
+        // anchored: set the tip back, let the anchoring job export that, then delete everything
+        // above it, and both verifications pass.
+        AuditChain chain = newChain();
+        for (int i = 0; i < 10; i++) {
+            chain.append(AuditEvent.of("alice", "act." + i));
+        }
+        Checkpoint honest = chain.head().orElseThrow();
+
+        String hashOfThree = jdbcTemplate
+                .queryForObject("SELECT hash FROM audit_chain WHERE sequence = 3", String.class).trim();
+        jdbcTemplate.update("UPDATE audit_chain_head SET last_sequence = 3, last_hash = ?,"
+                + " record_count = 4 WHERE chain_table = 'audit_chain'", hashOfThree);
+
+        assertThat(chain.head().orElseThrow().sequence())
+                .as("the tip row cannot choose the anchor")
+                .isEqualTo(honest.sequence());
+    }
+
+    @Test
+    void aChainWithACustomTableNameDoesNotRaceOnItsFirstAppends() throws Exception {
+        // The shipped schema seeds a tip row for the default table name only, so any other chain
+        // starts without one, and a lock on a row that is not there takes nothing. The store now
+        // creates the row itself, in a transaction of its own so two writers cannot both try inside
+        // their own uncommitted append.
+        jdbcTemplate.execute("CREATE TABLE my_audit AS SELECT * FROM audit_chain WHERE 1 = 0");
+        jdbcTemplate.update("DELETE FROM audit_chain_head");
+        int total = 40;
+
+        ExecutorService pool = Executors.newFixedThreadPool(8);
+        CountDownLatch start = new CountDownLatch(1);
+        List<Future<?>> futures = new ArrayList<>();
+        for (int i = 0; i < total; i++) {
+            AuditChain node = new AuditChain(KEY,
+                    new JdbcAuditStore(jdbcTemplate, "my_audit", JdbcAuditStore.DEFAULT_HEAD_TABLE,
+                            new DataSourceTransactionManager(database)),
+                    "my_audit");
+            futures.add(pool.submit(() -> node.append(AuditEvent.of("user", "act"))));
+        }
+        start.countDown();
+        int stored = 0;
+        for (Future<?> future : futures) {
+            try {
+                future.get(30, TimeUnit.SECONDS);
+                stored++;
+            } catch (ExecutionException e) {
+                // counted as a loss
+            }
+        }
+        pool.shutdownNow();
+
+        assertThat(stored).as("no append may be lost on a freshly created chain").isEqualTo(total);
+        assertThat(jdbcTemplate.queryForObject("SELECT COUNT(*) FROM my_audit", Long.class))
+                .isEqualTo(total);
     }
 }

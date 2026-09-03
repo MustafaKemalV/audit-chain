@@ -222,10 +222,20 @@ public final class AuditChain {
         }
 
         // Everything above only proves that the records present form a valid chain, and a truncated
-        // chain does exactly that. The high-water mark is the only thing that remembers how long the
-        // chain has been, so this is the check that makes deleting the newest records visible.
+        // chain does exactly that. The stored tip is the only thing that remembers how long the
+        // chain has been, so these two checks are what make deleting the newest records visible.
+        //
+        // The tip was read before the walk, deliberately: an append landing while we page can only
+        // make the chain longer than the tip we hold, never shorter, so neither check can fire on a
+        // chain that is merely growing.
         if (seen < head.recordCount()) {
             return VerificationResult.broken(seen, FailureReason.TRUNCATED);
+        }
+        if (head.isEmpty() && seen > 0) {
+            // Records with no tip at all. Removing the tip row used to disable the truncation check
+            // silently, so deleting it along with the records reported a clean chain; the two
+            // sources contradicting each other is free to detect and says more than either alone.
+            return VerificationResult.broken(0L, FailureReason.CHAIN_HEAD_MISMATCH);
         }
         return VerificationResult.intact();
     }
@@ -254,10 +264,11 @@ public final class AuditChain {
      * @return the head checkpoint, or empty
      */
     public Optional<Checkpoint> head() {
-        ChainHead head = store.head();
-        return head.isEmpty()
-                ? Optional.empty()
-                : Optional.of(new Checkpoint(head.lastSequence(), head.lastHash()));
+        // From a real record, not from the stored tip. Anchoring what the tip claims would let
+        // anyone who can write to it choose what gets anchored: set the tip back, let the anchoring
+        // job export that, then delete everything above it, and both verifications pass. An anchor
+        // is only worth what its source is worth.
+        return store.last().map(record -> new Checkpoint(record.record().sequence(), record.hash()));
     }
 
     /**
