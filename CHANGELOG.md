@@ -6,7 +6,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 Published versions on Maven Central are immutable, so this file is the only record of what changed
 between them.
 
-## [Unreleased]
+## [0.1.0] - 2026-09-03
+
+First release.
 
 ### Added
 

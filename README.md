@@ -1,6 +1,7 @@
 # audit-chain
 
 [![CI](https://github.com/MustafaKemalV/audit-chain/actions/workflows/ci.yml/badge.svg)](https://github.com/MustafaKemalV/audit-chain/actions/workflows/ci.yml)
+[![Maven Central](https://img.shields.io/maven-central/v/io.github.mustafakemalv/audit-chain-spring-boot-starter)](https://central.sonatype.com/artifact/io.github.mustafakemalv/audit-chain-spring-boot-starter)
 
 A Spring Boot starter for a **tamper-evident, append-only audit log**. Each record is hash-chained
 to the previous one with HMAC-SHA256, so any change to a past entry breaks the chain and `verify()`
@@ -50,21 +51,11 @@ the chain in plain Java, or in a framework other than Spring, and intend to writ
 
 ## Installation
 
-Not yet published to Maven Central. Build and install it into your local Maven repository:
-
-```bash
-git clone https://github.com/MustafaKemalV/audit-chain.git
-cd audit-chain
-mvn install
-```
-
-Then add the starter:
-
 ```xml
 <dependency>
     <groupId>io.github.mustafakemalv</groupId>
     <artifactId>audit-chain-spring-boot-starter</artifactId>
-    <version>0.1.0-SNAPSHOT</version>
+    <version>0.1.0</version>
 </dependency>
 ```
 
@@ -74,7 +65,7 @@ Or, for the chain alone with no Spring on the classpath:
 <dependency>
     <groupId>io.github.mustafakemalv</groupId>
     <artifactId>audit-chain-core</artifactId>
-    <version>0.1.0-SNAPSHOT</version>
+    <version>0.1.0</version>
 </dependency>
 ```
 
