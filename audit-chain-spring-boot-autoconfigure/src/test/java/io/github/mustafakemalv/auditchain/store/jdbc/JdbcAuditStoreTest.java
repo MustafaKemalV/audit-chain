@@ -14,6 +14,12 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.LongStream;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -193,5 +199,92 @@ class JdbcAuditStoreTest {
         assertThatThrownBy(() -> store.append(first))
                 .isInstanceOf(AuditStoreException.class);
         assertThat(store.count()).isEqualTo(1L);
+    }
+
+    @Test
+    void deletingTheNewestRowsIsDetected() {
+        // Straight SQL, bypassing the library entirely, the way an attacker with DELETE would do it.
+        // What is left is a valid shorter chain, so only the remembered length reveals the deletion.
+        AuditChain chain = newChain();
+        for (int i = 0; i < 5; i++) {
+            chain.append(AuditEvent.of("alice", "act." + i));
+        }
+        assertThat(chain.verify().valid()).isTrue();
+
+        jdbcTemplate.update("DELETE FROM audit_chain WHERE sequence >= 3");
+
+        VerificationResult result = chain.verify();
+        assertThat(result.valid()).isFalse();
+        assertThat(result.reason()).isEqualTo(FailureReason.TRUNCATED);
+        assertThat(result.brokenSequence()).isEqualTo(3L);
+    }
+
+    @Test
+    void deletingEveryRowIsDetected() {
+        AuditChain chain = newChain();
+        for (int i = 0; i < 3; i++) {
+            chain.append(AuditEvent.of("alice", "act." + i));
+        }
+
+        jdbcTemplate.update("DELETE FROM audit_chain");
+
+        VerificationResult result = chain.verify();
+        assertThat(result.valid()).isFalse();
+        assertThat(result.reason()).isEqualTo(FailureReason.TRUNCATED);
+    }
+
+    @Test
+    void aCorruptDetailsColumnIsReportedRatherThanThrown() {
+        // The scenario the library exists for: someone altered a row. Verification must answer
+        // "broken here", not propagate a decoding error from a JDK utility class, or a monitoring
+        // job that calls verify() on a schedule crashes instead of alerting.
+        AuditChain chain = newChain();
+        chain.append(AuditEvent.of("alice", "login"));
+        chain.append(new AuditEvent("bob", "delete", "doc", "2", Map.of("reason", "cleanup")));
+
+        jdbcTemplate.update("UPDATE audit_chain SET details = 'not-base64!!!' WHERE sequence = 1");
+
+        VerificationResult result = chain.verify();
+        assertThat(result.valid()).isFalse();
+        assertThat(result.reason()).isEqualTo(FailureReason.UNREADABLE_RECORD);
+        assertThat(result.brokenSequence()).isEqualTo(1L);
+    }
+
+    @Test
+    void concurrentAppendsFromTwoChainsLoseNothing() throws Exception {
+        // Two application instances writing to one database. This used to drop about half the
+        // records while verify() still reported the chain intact, which is the worst combination
+        // available to an audit log: missing evidence and a clean bill of health.
+        AuditChain node1 = newChain();
+        AuditChain node2 = newChain();
+        int total = 60;
+        ExecutorService pool = Executors.newFixedThreadPool(8);
+        CountDownLatch start = new CountDownLatch(1);
+        List<Future<?>> futures = new ArrayList<>();
+
+        for (int i = 0; i < total; i++) {
+            AuditChain node = (i % 2 == 0) ? node1 : node2;
+            futures.add(pool.submit(() -> {
+                start.await();
+                return node.append(AuditEvent.of("user", "payment.approve"));
+            }));
+        }
+        start.countDown();
+        int stored = 0;
+        for (Future<?> future : futures) {
+            try {
+                future.get(30, TimeUnit.SECONDS);
+                stored++;
+            } catch (ExecutionException e) {
+                // counted as a loss below
+            }
+        }
+        pool.shutdownNow();
+
+        assertThat(stored).as("every append must be recorded").isEqualTo(total);
+        assertThat(store.count()).isEqualTo(total);
+        assertThat(newChain().verify().valid()).isTrue();
+        assertThat(store.findAll().stream().map(r -> r.record().sequence()).toList())
+                .isEqualTo(LongStream.range(0, total).boxed().toList());
     }
 }

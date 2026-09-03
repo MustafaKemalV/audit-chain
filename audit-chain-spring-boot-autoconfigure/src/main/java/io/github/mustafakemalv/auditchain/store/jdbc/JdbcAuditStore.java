@@ -1,6 +1,7 @@
 package io.github.mustafakemalv.auditchain.store.jdbc;
 
 import io.github.mustafakemalv.auditchain.core.AuditRecord;
+import io.github.mustafakemalv.auditchain.core.ChainHead;
 import io.github.mustafakemalv.auditchain.core.ChainedRecord;
 import io.github.mustafakemalv.auditchain.store.AuditStore;
 import io.github.mustafakemalv.auditchain.store.AuditStoreException;
@@ -8,12 +9,16 @@ import io.github.mustafakemalv.auditchain.store.DetailsCodec;
 import java.sql.PreparedStatement;
 import java.time.Instant;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.function.Function;
 import java.util.regex.Pattern;
 import org.springframework.dao.DataAccessException;
 import org.springframework.dao.EmptyResultDataAccessException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
+import org.springframework.jdbc.datasource.DataSourceTransactionManager;
+import org.springframework.transaction.support.TransactionTemplate;
 
 /**
  * JDBC-backed {@link AuditStore} that appends each record as one row via {@link JdbcTemplate}. The
@@ -38,6 +43,9 @@ public class JdbcAuditStore implements AuditStore {
     private static final Pattern SAFE_TABLE_NAME = Pattern.compile("^[A-Za-z_][A-Za-z0-9_]*$");
     private static final int MAX_DETAILS_LENGTH = 4000;
 
+    /** Default name of the table holding one tip row per audit table. */
+    public static final String DEFAULT_HEAD_TABLE = "audit_chain_head";
+
     private static final RowMapper<ChainedRecord> ROW_MAPPER = (rs, rowNum) -> {
         AuditRecord record = new AuditRecord(
                 rs.getLong("sequence"),
@@ -56,6 +64,8 @@ public class JdbcAuditStore implements AuditStore {
 
     private final JdbcTemplate jdbcTemplate;
     private final String tableName;
+    private final String headTableName;
+    private final TransactionTemplate transactionTemplate;
 
     /**
      * Creates a store over {@code tableName}.
@@ -66,6 +76,19 @@ public class JdbcAuditStore implements AuditStore {
      *     identifier
      */
     public JdbcAuditStore(JdbcTemplate jdbcTemplate, String tableName) {
+        this(jdbcTemplate, tableName, DEFAULT_HEAD_TABLE);
+    }
+
+    /**
+     * Creates a store over {@code tableName}, tracking its tip in {@code headTableName}.
+     *
+     * @param jdbcTemplate the template to run statements through
+     * @param tableName the audit table, which must be a plain identifier
+     * @param headTableName the table holding one tip row per audit table
+     * @throws IllegalArgumentException if the template is null or either name is not a plain
+     *     identifier
+     */
+    public JdbcAuditStore(JdbcTemplate jdbcTemplate, String tableName, String headTableName) {
         if (jdbcTemplate == null) {
             throw new IllegalArgumentException("jdbcTemplate is required");
         }
@@ -74,8 +97,31 @@ public class JdbcAuditStore implements AuditStore {
         if (tableName == null || !SAFE_TABLE_NAME.matcher(tableName).matches()) {
             throw new IllegalArgumentException("tableName must match " + SAFE_TABLE_NAME.pattern());
         }
+        if (headTableName == null || !SAFE_TABLE_NAME.matcher(headTableName).matches()) {
+            throw new IllegalArgumentException("headTableName must match " + SAFE_TABLE_NAME.pattern());
+        }
         this.jdbcTemplate = jdbcTemplate;
         this.tableName = tableName;
+        this.headTableName = headTableName;
+        // Default propagation joins the caller's transaction when there is one and starts its own
+        // when there is not. That second case is what matters: outside a transaction the row lock
+        // taken while reading the tip would be released immediately and protect nothing.
+        this.transactionTemplate = jdbcTemplate.getDataSource() == null
+                ? null
+                : new TransactionTemplate(new DataSourceTransactionManager(jdbcTemplate.getDataSource()));
+    }
+
+    @Override
+    public ChainedRecord appendSealed(String genesisHash, Function<ChainHead, ChainedRecord> sealer) {
+        if (transactionTemplate == null) {
+            return AuditStore.super.appendSealed(genesisHash, sealer);
+        }
+        return transactionTemplate.execute(status -> {
+            ChainHead head = lockHead(genesisHash);
+            ChainedRecord sealed = sealer.apply(head);
+            append(sealed);
+            return sealed;
+        });
     }
 
     @Override
@@ -103,10 +149,51 @@ public class JdbcAuditStore implements AuditStore {
                     encodedDetails,
                     record.previousHash(),
                     record.hash());
+            // Move the tip in the same transaction as the record. If these could drift apart, the
+            // high-water mark would either miss real records or claim records that never existed.
+            int updated = jdbcTemplate.update(
+                    "UPDATE " + headTableName + " SET last_sequence = ?, last_hash = ?,"
+                            + " record_count = record_count + 1, updated_ms = ? WHERE chain_table = ?",
+                    r.sequence(), record.hash(), System.currentTimeMillis(), tableName);
+            if (updated == 0) {
+                jdbcTemplate.update(
+                        "INSERT INTO " + headTableName + " (chain_table, last_sequence, last_hash,"
+                                + " record_count, updated_ms) VALUES (?, ?, ?, ?, ?)",
+                        tableName, r.sequence(), record.hash(), 1L, System.currentTimeMillis());
+            }
         } catch (DataAccessException e) {
             // Includes the duplicate-sequence case: two appends raced and this one lost. The SPI
             // requires that to be an error rather than a second record on the same sequence.
             throw new AuditStoreException("could not append audit record " + r.sequence(), e);
+        }
+    }
+
+    @Override
+    public ChainHead head(String genesisHash) {
+        return readHead(genesisHash, false);
+    }
+
+    @Override
+    public ChainHead lockHead(String genesisHash) {
+        return readHead(genesisHash, true);
+    }
+
+    private ChainHead readHead(String genesisHash, boolean forUpdate) {
+        String sql = "SELECT last_sequence, last_hash, record_count FROM " + headTableName
+                + " WHERE chain_table = ?" + (forUpdate ? " FOR UPDATE" : "");
+        try {
+            Map<String, Object> row = jdbcTemplate.queryForMap(sql, tableName);
+            return new ChainHead(
+                    ((Number) row.get("last_sequence")).longValue(),
+                    // CHAR(64) is blank-padded on some databases, so trim before it reaches a hash
+                    // comparison.
+                    ((String) row.get("last_hash")).trim(),
+                    ((Number) row.get("record_count")).longValue());
+        } catch (EmptyResultDataAccessException e) {
+            // No tip row yet: this chain has never been appended to.
+            return ChainHead.empty(genesisHash);
+        } catch (DataAccessException e) {
+            throw new AuditStoreException("could not read the tip of the audit chain", e);
         }
     }
 

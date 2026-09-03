@@ -5,6 +5,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import io.github.mustafakemalv.auditchain.core.AuditEvent;
 import io.github.mustafakemalv.auditchain.core.CanonicalEncoder;
+import io.github.mustafakemalv.auditchain.core.ChainHead;
 import io.github.mustafakemalv.auditchain.core.AuditRecord;
 import io.github.mustafakemalv.auditchain.core.ChainedRecord;
 import io.github.mustafakemalv.auditchain.core.Checkpoint;
@@ -146,6 +147,26 @@ class AuditChainTest {
     private static final class TamperedStore implements AuditStore {
 
         private final List<ChainedRecord> records = new ArrayList<>();
+        private final long highWaterMark;
+
+        TamperedStore() {
+            this(0L);
+        }
+
+        /** Stands in for a chain whose head row still remembers a length the rows no longer reach. */
+        TamperedStore(long highWaterMark) {
+            this.highWaterMark = highWaterMark;
+        }
+
+        @Override
+        public ChainHead head(String genesisHash) {
+            long mark = Math.max(highWaterMark, records.size());
+            if (records.isEmpty()) {
+                return new ChainHead(-1L, genesisHash, mark);
+            }
+            ChainedRecord last = records.get(records.size() - 1);
+            return new ChainHead(last.record().sequence(), last.hash(), mark);
+        }
 
         @Override
         public void append(ChainedRecord record) {
@@ -229,14 +250,16 @@ class AuditChainTest {
     }
 
     @Test
-    void verifyAgainstCheckpointDetectsAMissingAnchoredRecord() {
-        // the chain is internally valid, but the anchored sequence is not in it
+    void verifyAgainstCheckpointDetectsAChainShorterThanTheAnchor() {
+        // The chain is internally valid but no longer reaches the anchored sequence, which is what
+        // deleting everything above the anchor looks like. Reported as TRUNCATED rather than a
+        // checkpoint mismatch, because the anchor did not disagree with a record: the record is gone.
         AuditChain chain = chainOver(storeWithThreeRecords());
         Checkpoint anchor = new Checkpoint(99L, "0".repeat(64));
 
         VerificationResult result = chain.verifyAgainstCheckpoint(anchor);
         assertThat(result.valid()).isFalse();
-        assertThat(result.reason()).isEqualTo(FailureReason.CHECKPOINT_MISMATCH);
+        assertThat(result.reason()).isEqualTo(FailureReason.TRUNCATED);
         assertThat(result.brokenSequence()).isEqualTo(99L);
     }
 
@@ -298,15 +321,67 @@ class AuditChainTest {
     }
 
     @Test
-    void aRecordClaimingAnUnknownFormatVersionIsNotSilentlyAccepted() {
-        // A row whose version this build cannot write must not be hashed under a guessed layout.
+    void aRecordClaimingAnUnknownFormatVersionIsReportedAsUnreadable() {
+        // A row whose version this build cannot write must not be hashed under a guessed layout,
+        // which would report a mismatch and read as tampering. It must also not throw: verify() has
+        // to answer for any content the table happens to hold.
         List<ChainedRecord> good = storeWithThreeRecords().findAll();
         ChainedRecord first = good.get(0);
         TamperedStore store = new TamperedStore();
         store.append(new ChainedRecord(first.record(), first.previousHash(), first.hash(), 99));
 
-        assertThatThrownBy(() -> chainOver(store).verify())
-                .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("unsupported format version");
+        VerificationResult result = chainOver(store).verify();
+        assertThat(result.valid()).isFalse();
+        assertThat(result.reason()).isEqualTo(FailureReason.UNREADABLE_RECORD);
+        assertThat(result.brokenSequence()).isZero();
+    }
+
+    @Test
+    void deletingTheNewestRecordsIsDetected() {
+        // The whole point of the high-water mark. What remains is a perfectly valid shorter chain,
+        // so the hash links alone say "intact"; only the remembered length reveals the deletion.
+        InMemoryAuditStore store = new InMemoryAuditStore();
+        AuditChain chain = chainOver(store);
+        for (int i = 0; i < 5; i++) {
+            chain.append(AuditEvent.of("alice", "act." + i));
+        }
+        assertThat(chain.verify().valid()).isTrue();
+
+        // an attacker deletes the three newest rows, straight against the database
+        TamperedStore truncated = new TamperedStore(store.head(AuditChain.GENESIS_PREVIOUS_HASH).recordCount());
+        store.findRange(0L, 2).forEach(truncated::append);
+
+        VerificationResult result = chainOver(truncated).verify();
+        assertThat(result.valid()).isFalse();
+        assertThat(result.reason()).isEqualTo(FailureReason.TRUNCATED);
+        assertThat(result.brokenSequence()).isEqualTo(2L);
+    }
+
+    @Test
+    void deletingTheEntireLogIsDetected() {
+        InMemoryAuditStore store = new InMemoryAuditStore();
+        AuditChain chain = chainOver(store);
+        for (int i = 0; i < 5; i++) {
+            chain.append(AuditEvent.of("alice", "act." + i));
+        }
+
+        TamperedStore wiped = new TamperedStore(store.head(AuditChain.GENESIS_PREVIOUS_HASH).recordCount());
+
+        VerificationResult result = chainOver(wiped).verify();
+        assertThat(result.valid()).isFalse();
+        assertThat(result.reason()).isEqualTo(FailureReason.TRUNCATED);
+        assertThat(result.brokenSequence()).isZero();
+    }
+
+    @Test
+    void anIntactChainIsNotReportedAsTruncated() {
+        InMemoryAuditStore store = new InMemoryAuditStore();
+        AuditChain chain = chainOver(store);
+        for (int i = 0; i < 5; i++) {
+            chain.append(AuditEvent.of("alice", "act." + i));
+        }
+
+        assertThat(chain.verify().valid()).isTrue();
+        assertThat(chain.verify().reason()).isEqualTo(FailureReason.NONE);
     }
 }

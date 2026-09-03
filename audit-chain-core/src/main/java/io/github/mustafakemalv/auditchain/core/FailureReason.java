@@ -16,5 +16,18 @@ public enum FailureReason {
     SEQUENCE_GAP,
 
     /** The chain is internally consistent but does not match an externally anchored checkpoint. */
-    CHECKPOINT_MISMATCH
+    CHECKPOINT_MISMATCH,
+
+    /**
+     * Records are missing from the end of the chain. The hash links cannot reveal this on their own,
+     * because what is left is still a valid shorter chain; it is caught by comparing the records
+     * present against the high-water mark the chain reached.
+     */
+    TRUNCATED,
+
+    /**
+     * A stored record could not be read back into its original shape. Treated as a break rather than
+     * an error, because unreadable bytes in an audit row are what tampering looks like.
+     */
+    UNREADABLE_RECORD
 }

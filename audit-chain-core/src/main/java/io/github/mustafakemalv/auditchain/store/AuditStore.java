@@ -1,9 +1,11 @@
 package io.github.mustafakemalv.auditchain.store;
 
+import io.github.mustafakemalv.auditchain.core.ChainHead;
 import io.github.mustafakemalv.auditchain.core.ChainedRecord;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import java.util.function.Function;
 
 /**
  * Storage SPI for the audit chain. The contract is deliberately append-only: there is no update or
@@ -94,6 +96,68 @@ public interface AuditStore {
             }
         }
         return slice;
+    }
+
+    /**
+     * The tip of the chain: where the next record attaches, and how many records have ever been
+     * appended.
+     *
+     * <p>The default derives it from {@link #last()} and {@link #count()}, which is correct but
+     * cannot notice a truncated chain: a count taken from the rows that remain always agrees with
+     * those rows. A store that can keep a durable high-water mark should do so and report it here,
+     * because that is what turns "records were deleted from the end" from invisible into detectable.
+     *
+     * @param genesisHash the value an empty chain's first record links to
+     * @return the current tip
+     * @throws AuditStoreException if the store cannot be reached
+     */
+    default ChainHead head(String genesisHash) {
+        return last()
+                .map(record -> new ChainHead(record.record().sequence(), record.hash(), count()))
+                .orElseGet(() -> ChainHead.empty(genesisHash));
+    }
+
+    /**
+     * The tip of the chain, read in a way that serializes concurrent appends until the caller's work
+     * is committed.
+     *
+     * <p>A hash chain cannot be built in parallel: a record cannot be sealed until the one before it
+     * is settled, so two appends that both read the same tip will compute the same sequence number
+     * and one of them must lose. A store backed by a database should take a row lock here, which
+     * turns that collision into an orderly queue. The default simply reads, which is right for a
+     * store whose appends are already serialized in memory.
+     *
+     * @param genesisHash the value an empty chain's first record links to
+     * @return the current tip
+     * @throws AuditStoreException if the store cannot be reached
+     */
+    default ChainHead lockHead(String genesisHash) {
+        return head(genesisHash);
+    }
+
+    /**
+     * Seals and stores one record as a single unit of work.
+     *
+     * <p>Reading the tip and writing the record have to be one atomic step. Split apart, two writers
+     * can both read the same tip before either has written, compute the same sequence number, and
+     * one of them loses its record. A row lock alone does not fix that: outside a transaction the
+     * lock is released the moment the read finishes, so the guarantee quietly disappears exactly
+     * when nobody is looking.
+     *
+     * <p>{@code sealer} receives the current tip and returns the record to store, which is where the
+     * chain computes the hash. A store backed by a database should run the whole call in one
+     * transaction, joining the caller's if there is one.
+     *
+     * @param genesisHash the value an empty chain's first record links to
+     * @param sealer turns the current tip into the record to append
+     * @return the record that was stored
+     * @throws AuditStoreException if the store cannot be reached or rejects the write
+     */
+    default ChainedRecord appendSealed(String genesisHash, Function<ChainHead, ChainedRecord> sealer) {
+        ChainHead head = lockHead(genesisHash);
+        ChainedRecord sealed = sealer.apply(head);
+        append(sealed);
+        return sealed;
     }
 
     /**

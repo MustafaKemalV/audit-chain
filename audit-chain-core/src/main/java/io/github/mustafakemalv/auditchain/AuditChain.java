@@ -3,18 +3,21 @@ package io.github.mustafakemalv.auditchain;
 import io.github.mustafakemalv.auditchain.core.AuditEvent;
 import io.github.mustafakemalv.auditchain.core.AuditRecord;
 import io.github.mustafakemalv.auditchain.core.CanonicalEncoder;
+import io.github.mustafakemalv.auditchain.core.ChainHead;
 import io.github.mustafakemalv.auditchain.core.ChainedRecord;
 import io.github.mustafakemalv.auditchain.core.Checkpoint;
 import io.github.mustafakemalv.auditchain.core.FailureReason;
 import io.github.mustafakemalv.auditchain.core.Hmac;
 import io.github.mustafakemalv.auditchain.core.VerificationResult;
 import io.github.mustafakemalv.auditchain.store.AuditStore;
+import io.github.mustafakemalv.auditchain.store.MalformedRecordException;
 import java.io.ByteArrayOutputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.time.Clock;
 import java.time.Instant;
+import java.util.List;
 import java.util.Optional;
 
 /**
@@ -54,6 +57,12 @@ public class AuditChain {
      * its own version.
      */
     private static final String DOMAIN_TAG = "audit-chain/v1";
+
+    /**
+     * How many records verification reads at a time. Verifying used to load the entire log at once,
+     * which is a guaranteed out-of-memory failure on a chain that has been running for years.
+     */
+    private static final int VERIFY_PAGE_SIZE = 1000;
 
     private final byte[] key;
     private final AuditStore store;
@@ -116,17 +125,19 @@ public class AuditChain {
         if (event == null) {
             throw new IllegalArgumentException("event is required");
         }
-        ChainedRecord previous = store.last().orElse(null);
-        long sequence = previous == null ? 0L : previous.record().sequence() + 1;
-        String previousHash = previous == null ? GENESIS_PREVIOUS_HASH : previous.hash();
-        Instant timestamp = clock.instant(); // AuditRecord truncates to millis
-        AuditRecord record = new AuditRecord(sequence, timestamp, event.actor(), event.action(),
-                event.resourceType(), event.resourceId(), event.details());
-        int formatVersion = CanonicalEncoder.CURRENT_FORMAT_VERSION;
-        String hash = computeHash(record, previousHash, formatVersion);
-        ChainedRecord chained = new ChainedRecord(record, previousHash, hash, formatVersion);
-        store.append(chained);
-        return chained;
+        // Handing the whole step to the store keeps reading the tip and writing the record in one
+        // unit of work. Doing it here as two calls would let two writers read the same tip and
+        // compute the same sequence number, and one of their records would be lost.
+        return store.appendSealed(GENESIS_PREVIOUS_HASH, head -> {
+            long sequence = head.nextSequence();
+            String previousHash = head.lastHash();
+            Instant timestamp = clock.instant(); // AuditRecord truncates to millis
+            AuditRecord record = new AuditRecord(sequence, timestamp, event.actor(), event.action(),
+                    event.resourceType(), event.resourceId(), event.details());
+            int formatVersion = CanonicalEncoder.CURRENT_FORMAT_VERSION;
+            String hash = computeHash(record, previousHash, formatVersion);
+            return new ChainedRecord(record, previousHash, hash, formatVersion);
+        });
     }
 
     /**
@@ -136,26 +147,77 @@ public class AuditChain {
      * @return where the chain first breaks, or an intact result
      */
     public VerificationResult verify() {
+        ChainHead head = store.head(GENESIS_PREVIOUS_HASH);
         String expectedPreviousHash = GENESIS_PREVIOUS_HASH;
         long expectedSequence = 0L;
-        for (ChainedRecord chained : store.findAll()) {
-            AuditRecord record = chained.record();
-            if (record.sequence() != expectedSequence) {
-                return VerificationResult.broken(record.sequence(), FailureReason.SEQUENCE_GAP);
+        long seen = 0L;
+
+        while (true) {
+            List<ChainedRecord> page;
+            try {
+                page = store.findRange(expectedSequence, VERIFY_PAGE_SIZE);
+            } catch (MalformedRecordException e) {
+                // A row whose bytes cannot be read back is what tampering looks like, so it is
+                // reported as a break rather than thrown at the caller. Verification has to stay
+                // total: a monitoring job asking "is the log intact" must get an answer for any
+                // content the table happens to hold.
+                return locateUnreadableRecord(expectedSequence);
             }
-            if (!chained.previousHash().equals(expectedPreviousHash)) {
-                return VerificationResult.broken(record.sequence(), FailureReason.BROKEN_LINK);
+            if (page.isEmpty()) {
+                break;
             }
-            String recomputed = computeHash(record, chained.previousHash(), chained.formatVersion());
-            if (!Hmac.constantTimeEquals(
-                    recomputed.getBytes(StandardCharsets.UTF_8),
-                    chained.hash().getBytes(StandardCharsets.UTF_8))) {
-                return VerificationResult.broken(record.sequence(), FailureReason.HASH_MISMATCH);
+            for (ChainedRecord chained : page) {
+                AuditRecord record = chained.record();
+                if (record.sequence() != expectedSequence) {
+                    return VerificationResult.broken(record.sequence(), FailureReason.SEQUENCE_GAP);
+                }
+                if (!chained.previousHash().equals(expectedPreviousHash)) {
+                    return VerificationResult.broken(record.sequence(), FailureReason.BROKEN_LINK);
+                }
+                String recomputed;
+                try {
+                    recomputed = computeHash(record, chained.previousHash(), chained.formatVersion());
+                } catch (IllegalArgumentException e) {
+                    // A record claiming a format this build cannot write. Hashing it under a guessed
+                    // layout would report a mismatch, which reads as tampering that did not happen.
+                    return VerificationResult.broken(record.sequence(), FailureReason.UNREADABLE_RECORD);
+                }
+                if (!Hmac.constantTimeEquals(
+                        recomputed.getBytes(StandardCharsets.UTF_8),
+                        chained.hash().getBytes(StandardCharsets.UTF_8))) {
+                    return VerificationResult.broken(record.sequence(), FailureReason.HASH_MISMATCH);
+                }
+                expectedPreviousHash = chained.hash();
+                expectedSequence = record.sequence() + 1;
+                seen++;
             }
-            expectedPreviousHash = chained.hash();
-            expectedSequence = record.sequence() + 1;
+        }
+
+        // Everything above only proves that the records present form a valid chain, and a truncated
+        // chain does exactly that. The high-water mark is the only thing that remembers how long the
+        // chain has been, so this is the check that makes deleting the newest records visible.
+        if (seen < head.recordCount()) {
+            return VerificationResult.broken(seen, FailureReason.TRUNCATED);
         }
         return VerificationResult.intact();
+    }
+
+    /** Walks one page a record at a time to name the sequence whose stored bytes will not decode. */
+    private VerificationResult locateUnreadableRecord(long fromSequence) {
+        long sequence = fromSequence;
+        for (int scanned = 0; scanned < VERIFY_PAGE_SIZE; scanned++) {
+            List<ChainedRecord> single;
+            try {
+                single = store.findRange(sequence, 1);
+            } catch (MalformedRecordException e) {
+                return VerificationResult.broken(sequence, FailureReason.UNREADABLE_RECORD);
+            }
+            if (single.isEmpty()) {
+                break;
+            }
+            sequence = single.get(0).record().sequence() + 1;
+        }
+        return VerificationResult.broken(fromSequence, FailureReason.UNREADABLE_RECORD);
     }
 
     /**
@@ -164,13 +226,18 @@ public class AuditChain {
      * @return the head checkpoint, or empty
      */
     public Optional<Checkpoint> head() {
-        return store.last().map(record -> new Checkpoint(record.record().sequence(), record.hash()));
+        ChainHead head = store.head(GENESIS_PREVIOUS_HASH);
+        return head.isEmpty()
+                ? Optional.empty()
+                : Optional.of(new Checkpoint(head.lastSequence(), head.lastHash()));
     }
 
     /**
      * Verifies the chain internally and then against an externally anchored {@code checkpoint}. This
      * can catch a rewrite that {@link #verify()} cannot (for example one made with a stolen key),
-     * because the rewritten hash no longer matches the checkpoint that was anchored elsewhere.
+     * because the rewritten hash no longer matches the checkpoint that was anchored elsewhere. It
+     * also rejects a chain that no longer reaches the anchored sequence, which is what deleting
+     * everything above the anchor looks like.
      *
      * @param checkpoint a head checkpoint recorded earlier, ideally somewhere the chain's owner
      *     cannot quietly change
@@ -184,17 +251,25 @@ public class AuditChain {
         if (!internal.valid()) {
             return internal;
         }
-        for (ChainedRecord chained : store.findAll()) {
-            if (chained.record().sequence() == checkpoint.sequence()) {
-                boolean matches = Hmac.constantTimeEquals(
-                        chained.hash().getBytes(StandardCharsets.UTF_8),
-                        checkpoint.hash().getBytes(StandardCharsets.UTF_8));
-                return matches
-                        ? VerificationResult.intact()
-                        : VerificationResult.broken(checkpoint.sequence(), FailureReason.CHECKPOINT_MISMATCH);
-            }
+
+        // A checkpoint pins one point, so on its own it says nothing about what came after it. A
+        // chain that no longer reaches the anchored sequence has lost everything above it, which is
+        // exactly the deletion an anchor is supposed to make visible.
+        ChainHead head = store.head(GENESIS_PREVIOUS_HASH);
+        if (head.lastSequence() < checkpoint.sequence()) {
+            return VerificationResult.broken(checkpoint.sequence(), FailureReason.TRUNCATED);
         }
-        return VerificationResult.broken(checkpoint.sequence(), FailureReason.CHECKPOINT_MISMATCH);
+
+        List<ChainedRecord> anchored = store.findRange(checkpoint.sequence(), 1);
+        if (anchored.isEmpty() || anchored.get(0).record().sequence() != checkpoint.sequence()) {
+            return VerificationResult.broken(checkpoint.sequence(), FailureReason.CHECKPOINT_MISMATCH);
+        }
+        boolean matches = Hmac.constantTimeEquals(
+                anchored.get(0).hash().getBytes(StandardCharsets.UTF_8),
+                checkpoint.hash().getBytes(StandardCharsets.UTF_8));
+        return matches
+                ? VerificationResult.intact()
+                : VerificationResult.broken(checkpoint.sequence(), FailureReason.CHECKPOINT_MISMATCH);
     }
 
     private String computeHash(AuditRecord record, String previousHash, int formatVersion) {

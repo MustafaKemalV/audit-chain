@@ -1,5 +1,6 @@
 package io.github.mustafakemalv.auditchain.store;
 
+import io.github.mustafakemalv.auditchain.core.ChainHead;
 import io.github.mustafakemalv.auditchain.core.ChainedRecord;
 import java.util.ArrayList;
 import java.util.List;
@@ -18,6 +19,9 @@ public class InMemoryAuditStore implements AuditStore {
 
     private final List<ChainedRecord> records = new ArrayList<>();
 
+    /** Only ever grows, so verification can still tell that records went missing from the end. */
+    private long highWaterMark;
+
     /** Creates an empty store. */
     public InMemoryAuditStore() {
     }
@@ -35,6 +39,7 @@ public class InMemoryAuditStore implements AuditStore {
                     "sequence " + sequence + " is not above the current head; the chain would fork");
         }
         records.add(record);
+        highWaterMark++;
     }
 
     @Override
@@ -66,6 +71,15 @@ public class InMemoryAuditStore implements AuditStore {
             }
         }
         return slice;
+    }
+
+    @Override
+    public synchronized ChainHead head(String genesisHash) {
+        if (records.isEmpty()) {
+            return new ChainHead(-1L, genesisHash, highWaterMark);
+        }
+        ChainedRecord last = records.get(records.size() - 1);
+        return new ChainHead(last.record().sequence(), last.hash(), highWaterMark);
     }
 
     @Override
