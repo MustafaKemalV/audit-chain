@@ -2,6 +2,7 @@ package io.github.mustafakemalv.auditchain.autoconfigure;
 
 import io.github.mustafakemalv.auditchain.AuditChain;
 import io.github.mustafakemalv.auditchain.aop.AuditActorProvider;
+import io.github.mustafakemalv.auditchain.aop.AuditFailureMode;
 import io.github.mustafakemalv.auditchain.aop.AuditedAspect;
 import io.github.mustafakemalv.auditchain.store.AuditStore;
 import io.github.mustafakemalv.auditchain.store.InMemoryAuditStore;

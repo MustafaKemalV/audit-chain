@@ -4,16 +4,15 @@ import io.github.mustafakemalv.auditchain.core.ChainHead;
 import io.github.mustafakemalv.auditchain.core.ChainedRecord;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Optional;
 
 /**
  * In-memory {@link AuditStore}, kept in an {@code ArrayList} guarded by this object's monitor.
  * Intended for tests and demos, not for production durability: the log does not survive a restart.
  * Reads return copies so callers cannot mutate the backing list.
  *
- * <p>Like the JDBC store, it refuses a repeated sequence number. Without that check the SPI's one
- * unrecoverable failure, a forked chain, would be silently possible here while the JDBC store rejects
- * it, and code that verified fine against this store would break against a real database.
+ * <p>Like the JDBC store, it refuses a sequence that does not move forward, and it keeps a
+ * high-water mark that outlives the records, so a chain emptied through {@link #clear()} is still
+ * reported as truncated rather than as a fresh chain.
  */
 public class InMemoryAuditStore implements AuditStore {
 
@@ -27,7 +26,33 @@ public class InMemoryAuditStore implements AuditStore {
     }
 
     @Override
+    public synchronized ChainedRecord appendSealed(RecordSealer sealer) {
+        if (sealer == null) {
+            throw new IllegalArgumentException("sealer is required");
+        }
+        // The monitor spans reading the tip and storing the record, which is exactly the atomicity
+        // the SPI asks for. A store split across processes needs a row lock instead.
+        ChainedRecord sealed = sealer.seal(head());
+        store(sealed);
+        return sealed;
+    }
+
+    /**
+     * Stores a record directly, without sealing it against the current tip.
+     *
+     * <p>Deliberately not part of the SPI: writing without reading the tip in the same step is how
+     * concurrent appends lose records. It is here so tests can stage a chain, including a deliberately
+     * broken one.
+     *
+     * @param record the record to store
+     * @throws IllegalArgumentException if the record is null
+     * @throws AuditStoreException if its sequence does not move the chain forward
+     */
     public synchronized void append(ChainedRecord record) {
+        store(record);
+    }
+
+    private void store(ChainedRecord record) {
         if (record == null) {
             throw new IllegalArgumentException("record is required");
         }
@@ -42,17 +67,21 @@ public class InMemoryAuditStore implements AuditStore {
         highWaterMark++;
     }
 
-    @Override
-    public synchronized Optional<ChainedRecord> last() {
-        if (records.isEmpty()) {
-            return Optional.empty();
-        }
-        return Optional.of(records.get(records.size() - 1));
+    /**
+     * Removes every record while keeping the high-water mark, standing in for someone deleting rows
+     * from the table underneath the chain.
+     */
+    public synchronized void clear() {
+        records.clear();
     }
 
     @Override
-    public synchronized List<ChainedRecord> findAll() {
-        return new ArrayList<>(records);
+    public synchronized ChainHead head() {
+        if (records.isEmpty()) {
+            return ChainHead.emptyWithHistory(highWaterMark);
+        }
+        ChainedRecord last = records.get(records.size() - 1);
+        return new ChainHead(last.record().sequence(), last.hash(), highWaterMark);
     }
 
     @Override
@@ -74,12 +103,8 @@ public class InMemoryAuditStore implements AuditStore {
     }
 
     @Override
-    public synchronized ChainHead head(String genesisHash) {
-        if (records.isEmpty()) {
-            return new ChainHead(-1L, genesisHash, highWaterMark);
-        }
-        ChainedRecord last = records.get(records.size() - 1);
-        return new ChainHead(last.record().sequence(), last.hash(), highWaterMark);
+    public synchronized List<ChainedRecord> findAll() {
+        return new ArrayList<>(records);
     }
 
     @Override

@@ -79,7 +79,7 @@ class AuditChainTest {
                 "attacker", original.record().action(), original.record().resourceType(),
                 original.record().resourceId(), original.record().details());
         // keep the old hash: without the key the attacker cannot forge a matching one
-        ChainedRecord tampered = new ChainedRecord(altered, original.previousHash(), original.hash());
+        ChainedRecord tampered = ChainedRecord.currentFormat(altered, original.previousHash(), original.hash());
 
         InMemoryAuditStore store = new InMemoryAuditStore();
         store.append(good.get(0));
@@ -96,7 +96,7 @@ class AuditChainTest {
     void brokenPreviousHashIsDetectedAsBrokenLink() {
         List<ChainedRecord> good = storeWithThreeRecords().findAll();
         ChainedRecord original = good.get(2);
-        ChainedRecord broken = new ChainedRecord(original.record(), "0".repeat(64), original.hash());
+        ChainedRecord broken = ChainedRecord.currentFormat(original.record(), "0".repeat(64), original.hash());
 
         InMemoryAuditStore store = new InMemoryAuditStore();
         store.append(good.get(0));
@@ -158,28 +158,49 @@ class AuditChainTest {
             this.highWaterMark = highWaterMark;
         }
 
+        /** Stores whatever it is handed, with none of the checks a real store applies. */
+        void append(ChainedRecord record) {
+            records.add(record);
+        }
+
         @Override
-        public ChainHead head(String genesisHash) {
+        public ChainedRecord appendSealed(RecordSealer sealer) {
+            ChainedRecord sealed = sealer.seal(head());
+            records.add(sealed);
+            return sealed;
+        }
+
+        @Override
+        public ChainHead head() {
             long mark = Math.max(highWaterMark, records.size());
             if (records.isEmpty()) {
-                return new ChainHead(-1L, genesisHash, mark);
+                return ChainHead.emptyWithHistory(mark);
             }
             ChainedRecord last = records.get(records.size() - 1);
             return new ChainHead(last.record().sequence(), last.hash(), mark);
         }
 
         @Override
-        public void append(ChainedRecord record) {
-            records.add(record);
-        }
-
-        @Override
-        public Optional<ChainedRecord> last() {
-            return records.isEmpty() ? Optional.empty() : Optional.of(records.get(records.size() - 1));
+        public List<ChainedRecord> findRange(long fromSequence, int limit) {
+            if (limit <= 0) {
+                throw new IllegalArgumentException("limit must be positive");
+            }
+            List<ChainedRecord> slice = new ArrayList<>();
+            for (ChainedRecord record : records) {
+                if (record.record().sequence() >= fromSequence) {
+                    slice.add(record);
+                    if (slice.size() == limit) {
+                        break;
+                    }
+                }
+            }
+            return slice;
         }
 
         @Override
         public List<ChainedRecord> findAll() {
+            // Deliberately insertion order, not sequence order: staging a reordered chain is the
+            // whole point of this double, and a real store would sort it back into place.
             return new ArrayList<>(records);
         }
 
@@ -348,7 +369,7 @@ class AuditChainTest {
         assertThat(chain.verify().valid()).isTrue();
 
         // an attacker deletes the three newest rows, straight against the database
-        TamperedStore truncated = new TamperedStore(store.head(AuditChain.GENESIS_PREVIOUS_HASH).recordCount());
+        TamperedStore truncated = new TamperedStore(store.head().recordCount());
         store.findRange(0L, 2).forEach(truncated::append);
 
         VerificationResult result = chainOver(truncated).verify();
@@ -365,7 +386,7 @@ class AuditChainTest {
             chain.append(AuditEvent.of("alice", "act." + i));
         }
 
-        TamperedStore wiped = new TamperedStore(store.head(AuditChain.GENESIS_PREVIOUS_HASH).recordCount());
+        TamperedStore wiped = new TamperedStore(store.head().recordCount());
 
         VerificationResult result = chainOver(wiped).verify();
         assertThat(result.valid()).isFalse();

@@ -1,6 +1,6 @@
 package io.github.mustafakemalv.auditchain.autoconfigure;
 
-import io.github.mustafakemalv.auditchain.aop.AuditedAspect;
+import io.github.mustafakemalv.auditchain.aop.AuditFailureMode;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 
 /** Binds {@code audit-chain.*} configuration. */
@@ -36,7 +36,7 @@ public class AuditChainProperties {
      * operation succeed unrecorded. FAIL is the default because an audit log with silent holes is
      * hard to trust.
      */
-    private AuditedAspect.FailureMode onFailure = AuditedAspect.FailureMode.FAIL;
+    private AuditFailureMode onFailure = AuditFailureMode.FAIL;
 
     public boolean isEnabled() {
         return enabled;
@@ -62,11 +62,11 @@ public class AuditChainProperties {
         this.tableName = tableName;
     }
 
-    public AuditedAspect.FailureMode getOnFailure() {
+    public AuditFailureMode getOnFailure() {
         return onFailure;
     }
 
-    public void setOnFailure(AuditedAspect.FailureMode onFailure) {
+    public void setOnFailure(AuditFailureMode onFailure) {
         this.onFailure = onFailure;
     }
 

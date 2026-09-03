@@ -193,10 +193,11 @@ class JdbcAuditStoreTest {
     @Test
     void aDuplicateSequenceIsRejectedRatherThanForkingTheChain() {
         // The chain's whole anti-fork guarantee rests on the store refusing a repeated sequence.
+        // Handing back a record that ignores the tip stands in for any way that could happen.
         AuditChain chain = newChain();
         ChainedRecord first = chain.append(AuditEvent.of("alice", "login"));
 
-        assertThatThrownBy(() -> store.append(first))
+        assertThatThrownBy(() -> store.appendSealed(head -> first))
                 .isInstanceOf(AuditStoreException.class);
         assertThat(store.count()).isEqualTo(1L);
     }

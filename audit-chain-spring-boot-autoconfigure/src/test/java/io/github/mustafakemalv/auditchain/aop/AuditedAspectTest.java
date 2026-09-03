@@ -7,6 +7,7 @@ import io.github.mustafakemalv.auditchain.autoconfigure.AuditChainAutoConfigurat
 import io.github.mustafakemalv.auditchain.core.AuditRecord;
 import io.github.mustafakemalv.auditchain.core.ChainedRecord;
 import io.github.mustafakemalv.auditchain.store.AuditStore;
+import io.github.mustafakemalv.auditchain.store.AuditStore.RecordSealer;
 import io.github.mustafakemalv.auditchain.store.AuditStoreException;
 import io.github.mustafakemalv.auditchain.store.InMemoryAuditStore;
 import javax.sql.DataSource;
@@ -209,7 +210,7 @@ class AuditedAspectTest {
         AuditStore auditStore() {
             return new InMemoryAuditStore() {
                 @Override
-                public synchronized void append(ChainedRecord record) {
+                public synchronized ChainedRecord appendSealed(RecordSealer sealer) {
                     throw new AuditStoreException("the database is on fire");
                 }
             };

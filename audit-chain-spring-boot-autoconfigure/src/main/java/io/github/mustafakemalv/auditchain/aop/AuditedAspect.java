@@ -57,37 +57,22 @@ public class AuditedAspect {
 
     private final AuditChain auditChain;
     private final AuditActorProvider actorProvider;
-    private final FailureMode failureMode;
+    private final AuditFailureMode failureMode;
     private final ExpressionParser expressionParser = new SpelExpressionParser();
     private final ParameterNameDiscoverer parameterNameDiscoverer = new DefaultParameterNameDiscoverer();
     /** Parsing a SpEL string on every call is pure overhead; the expressions never change. */
     private final Map<String, Expression> expressionCache = new ConcurrentHashMap<>();
     private final Map<Method, Boolean> parameterNameWarnings = new ConcurrentHashMap<>();
 
-    /** What an {@code @Audited} method should do when the audit write itself fails. */
-    public enum FailureMode {
-
-        /**
-         * Let the failure propagate, so the business operation fails with it. Correct when the audit
-         * record matters as much as the action.
-         */
-        FAIL,
-
-        /**
-         * Log the failure and let the business operation succeed unrecorded. Correct only when
-         * availability outranks the completeness of the audit log; say so deliberately.
-         */
-        LOG
-    }
 
     /**
-     * Creates the aspect in {@link FailureMode#FAIL} mode.
+     * Creates the aspect in {@link AuditFailureMode#FAIL} mode.
      *
      * @param auditChain the chain to append to
      * @param actorProvider supplies who is acting
      */
     public AuditedAspect(AuditChain auditChain, AuditActorProvider actorProvider) {
-        this(auditChain, actorProvider, FailureMode.FAIL);
+        this(auditChain, actorProvider, AuditFailureMode.FAIL);
     }
 
     /**
@@ -97,7 +82,7 @@ public class AuditedAspect {
      * @param actorProvider supplies who is acting
      * @param failureMode what to do when the audit write fails
      */
-    public AuditedAspect(AuditChain auditChain, AuditActorProvider actorProvider, FailureMode failureMode) {
+    public AuditedAspect(AuditChain auditChain, AuditActorProvider actorProvider, AuditFailureMode failureMode) {
         if (auditChain == null) {
             throw new IllegalArgumentException("auditChain is required");
         }
@@ -135,7 +120,7 @@ public class AuditedAspect {
         try {
             auditChain.append(event);
         } catch (RuntimeException e) {
-            if (failureMode == FailureMode.FAIL) {
+            if (failureMode == AuditFailureMode.FAIL) {
                 throw e;
             }
             log.error("audit-chain: could not record " + event.action()

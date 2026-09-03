@@ -11,9 +11,17 @@ import org.junit.jupiter.api.Test;
 
 class InMemoryAuditStoreTest {
 
+    /**
+     * A stand-in hash with the shape a real one has: 64 lowercase hex characters, derived from a
+     * label so each one is distinct and stable across runs.
+     */
+    private static String hash(String label) {
+        return String.format("%064x", Math.abs((long) label.hashCode()) + 1);
+    }
+
     private static ChainedRecord chained(long sequence, String previousHash, String hash) {
         AuditRecord record = new AuditRecord(sequence, Instant.EPOCH, "actor", "action", null, null, Map.of());
-        return new ChainedRecord(record, previousHash, hash);
+        return ChainedRecord.currentFormat(record, previousHash, hash);
     }
 
     @Test
@@ -24,8 +32,8 @@ class InMemoryAuditStoreTest {
     @Test
     void appendMakesRecordTheHead() {
         InMemoryAuditStore store = new InMemoryAuditStore();
-        ChainedRecord first = chained(0, "gen", "h0");
-        ChainedRecord second = chained(1, "h0", "h1");
+        ChainedRecord first = chained(0, hash("gen"), hash("h0"));
+        ChainedRecord second = chained(1, hash("h0"), hash("h1"));
 
         store.append(first);
         store.append(second);
@@ -37,8 +45,8 @@ class InMemoryAuditStoreTest {
     @Test
     void findAllReturnsRecordsInAppendOrder() {
         InMemoryAuditStore store = new InMemoryAuditStore();
-        ChainedRecord first = chained(0, "gen", "h0");
-        ChainedRecord second = chained(1, "h0", "h1");
+        ChainedRecord first = chained(0, hash("gen"), hash("h0"));
+        ChainedRecord second = chained(1, hash("h0"), hash("h1"));
         store.append(first);
         store.append(second);
 
@@ -48,7 +56,7 @@ class InMemoryAuditStoreTest {
     @Test
     void findAllReturnsACopy() {
         InMemoryAuditStore store = new InMemoryAuditStore();
-        store.append(chained(0, "gen", "h0"));
+        store.append(chained(0, hash("gen"), hash("h0")));
 
         store.findAll().clear();
 
@@ -60,11 +68,11 @@ class InMemoryAuditStoreTest {
         // Two chains over one store used to race here and append duplicate sequence numbers, which
         // verification then reported forever as tampering that never happened.
         InMemoryAuditStore store = new InMemoryAuditStore();
-        store.append(chained(0L, "prev", "hash-0"));
+        store.append(chained(0L, hash("prev"), hash("hash-0")));
 
-        assertThatThrownBy(() -> store.append(chained(0L, "prev", "hash-0")))
+        assertThatThrownBy(() -> store.append(chained(0L, hash("prev"), hash("hash-0"))))
                 .isInstanceOf(AuditStoreException.class);
-        assertThatThrownBy(() -> store.append(chained(0L, "hash-0", "other")))
+        assertThatThrownBy(() -> store.append(chained(0L, hash("hash-0"), hash("other"))))
                 .isInstanceOf(AuditStoreException.class);
         assertThat(store.count()).isEqualTo(1L);
     }
@@ -72,10 +80,10 @@ class InMemoryAuditStoreTest {
     @Test
     void refusesASequenceThatGoesBackwards() {
         InMemoryAuditStore store = new InMemoryAuditStore();
-        store.append(chained(0L, "prev", "hash-0"));
-        store.append(chained(1L, "hash-0", "hash-1"));
+        store.append(chained(0L, hash("prev"), hash("hash-0")));
+        store.append(chained(1L, hash("hash-0"), hash("hash-1")));
 
-        assertThatThrownBy(() -> store.append(chained(1L, "hash-1", "hash-1b")))
+        assertThatThrownBy(() -> store.append(chained(1L, hash("hash-1"), hash("hash-1b"))))
                 .isInstanceOf(AuditStoreException.class);
         assertThat(store.count()).isEqualTo(2L);
     }
@@ -84,7 +92,7 @@ class InMemoryAuditStoreTest {
     void findRangeReturnsASliceInSequenceOrder() {
         InMemoryAuditStore store = new InMemoryAuditStore();
         for (long i = 0; i < 10; i++) {
-            store.append(chained(i, "prev-" + i, "hash-" + i));
+            store.append(chained(i, hash("p" + i), hash("h" + i)));
         }
 
         assertThat(store.findRange(3L, 4).stream().map(r -> r.record().sequence()).toList())

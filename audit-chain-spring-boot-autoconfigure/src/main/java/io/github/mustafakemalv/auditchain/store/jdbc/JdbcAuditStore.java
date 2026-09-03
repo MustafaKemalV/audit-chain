@@ -11,7 +11,6 @@ import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-import java.util.function.Function;
 import java.util.regex.Pattern;
 import org.springframework.dao.DataAccessException;
 import org.springframework.dao.EmptyResultDataAccessException;
@@ -115,20 +114,23 @@ public class JdbcAuditStore implements AuditStore {
     }
 
     @Override
-    public ChainedRecord appendSealed(String genesisHash, Function<ChainHead, ChainedRecord> sealer) {
-        if (transactionTemplate == null) {
-            return AuditStore.super.appendSealed(genesisHash, sealer);
+    public ChainedRecord appendSealed(RecordSealer sealer) {
+        if (sealer == null) {
+            throw new IllegalArgumentException("sealer is required");
         }
         return transactionTemplate.execute(status -> {
-            ChainHead head = lockHead(genesisHash);
-            ChainedRecord sealed = sealer.apply(head);
-            append(sealed);
+            ChainHead head = readHead(true);
+            ChainedRecord sealed = sealer.seal(head);
+            insert(sealed);
             return sealed;
         });
     }
 
-    @Override
-    public void append(ChainedRecord record) {
+    /**
+     * Writes one record and moves the tip, both inside the caller's transaction. Private because the
+     * SPI deliberately offers no way to store a record without having just read the tip.
+     */
+    private void insert(ChainedRecord record) {
         AuditRecord r = record.record();
         String encodedDetails = DetailsCodec.encode(r.details());
         // Fail fast instead of letting a non-strict database silently truncate a column. A truncated
@@ -185,16 +187,11 @@ public class JdbcAuditStore implements AuditStore {
     }
 
     @Override
-    public ChainHead head(String genesisHash) {
-        return readHead(genesisHash, false);
+    public ChainHead head() {
+        return readHead(false);
     }
 
-    @Override
-    public ChainHead lockHead(String genesisHash) {
-        return readHead(genesisHash, true);
-    }
-
-    private ChainHead readHead(String genesisHash, boolean forUpdate) {
+    private ChainHead readHead(boolean forUpdate) {
         String sql = "SELECT last_sequence, last_hash, record_count FROM " + headTableName
                 + " WHERE chain_table = ?" + (forUpdate ? " FOR UPDATE" : "");
         try {
@@ -207,7 +204,7 @@ public class JdbcAuditStore implements AuditStore {
                     ((Number) row.get("record_count")).longValue());
         } catch (EmptyResultDataAccessException e) {
             // No tip row yet: this chain has never been appended to.
-            return ChainHead.empty(genesisHash);
+            return ChainHead.empty();
         } catch (DataAccessException e) {
             throw new AuditStoreException("could not read the tip of the audit chain", e);
         }

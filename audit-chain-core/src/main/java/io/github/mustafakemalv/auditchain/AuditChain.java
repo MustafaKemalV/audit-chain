@@ -43,10 +43,14 @@ import java.util.Optional;
  * committed. Throughput therefore scales by running several chains, each with its own id and table,
  * rather than by making one chain faster.
  */
-public class AuditChain {
+public final class AuditChain {
 
-    /** The previous-hash value the first (genesis) record links to: 32 zero bytes as hex. */
-    public static final String GENESIS_PREVIOUS_HASH = "0".repeat(64);
+    /**
+     * The previous-hash value the first (genesis) record links to: 32 zero bytes as hex.
+     *
+     * @see ChainHead#GENESIS_HASH
+     */
+    public static final String GENESIS_PREVIOUS_HASH = ChainHead.GENESIS_HASH;
 
     /** The chain id used when none is given. */
     public static final String DEFAULT_CHAIN_ID = "default";
@@ -63,6 +67,12 @@ public class AuditChain {
      * which is a guaranteed out-of-memory failure on a chain that has been running for years.
      */
     private static final int VERIFY_PAGE_SIZE = 1000;
+
+    /**
+     * Guards append against itself. Deliberately not the instance monitor: with a public
+     * synchronized method any consumer could hold the lock and stall every audit write in the JVM.
+     */
+    private final Object appendLock = new Object();
 
     private final byte[] key;
     private final AuditStore store;
@@ -121,14 +131,20 @@ public class AuditChain {
      * @param event what happened
      * @return the record as it was stored
      */
-    public synchronized ChainedRecord append(AuditEvent event) {
+    public ChainedRecord append(AuditEvent event) {
         if (event == null) {
             throw new IllegalArgumentException("event is required");
         }
+        synchronized (appendLock) {
+            return sealAndStore(event);
+        }
+    }
+
+    private ChainedRecord sealAndStore(AuditEvent event) {
         // Handing the whole step to the store keeps reading the tip and writing the record in one
         // unit of work. Doing it here as two calls would let two writers read the same tip and
         // compute the same sequence number, and one of their records would be lost.
-        return store.appendSealed(GENESIS_PREVIOUS_HASH, head -> {
+        return store.appendSealed(head -> {
             long sequence = head.nextSequence();
             String previousHash = head.lastHash();
             Instant timestamp = clock.instant(); // AuditRecord truncates to millis
@@ -147,7 +163,7 @@ public class AuditChain {
      * @return where the chain first breaks, or an intact result
      */
     public VerificationResult verify() {
-        ChainHead head = store.head(GENESIS_PREVIOUS_HASH);
+        ChainHead head = store.head();
         String expectedPreviousHash = GENESIS_PREVIOUS_HASH;
         long expectedSequence = 0L;
         long seen = 0L;
@@ -226,7 +242,7 @@ public class AuditChain {
      * @return the head checkpoint, or empty
      */
     public Optional<Checkpoint> head() {
-        ChainHead head = store.head(GENESIS_PREVIOUS_HASH);
+        ChainHead head = store.head();
         return head.isEmpty()
                 ? Optional.empty()
                 : Optional.of(new Checkpoint(head.lastSequence(), head.lastHash()));
@@ -255,7 +271,7 @@ public class AuditChain {
         // A checkpoint pins one point, so on its own it says nothing about what came after it. A
         // chain that no longer reaches the anchored sequence has lost everything above it, which is
         // exactly the deletion an anchor is supposed to make visible.
-        ChainHead head = store.head(GENESIS_PREVIOUS_HASH);
+        ChainHead head = store.head();
         if (head.lastSequence() < checkpoint.sequence()) {
             return VerificationResult.broken(checkpoint.sequence(), FailureReason.TRUNCATED);
         }

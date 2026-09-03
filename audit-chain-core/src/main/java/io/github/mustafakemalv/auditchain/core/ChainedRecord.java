@@ -33,13 +33,20 @@ public record ChainedRecord(AuditRecord record, String previousHash, String hash
     }
 
     /**
-     * Creates a node under the format version this build writes.
+     * Creates a node stamped with the format version this build writes.
+     *
+     * <p>Deliberately a named factory rather than a constructor. A store reading a row back must
+     * carry the version stored with it; stamping the current version there instead would mark every
+     * older record as written under a format it was not, and after the encoding next changes those
+     * records would all report as tampered with. Naming the operation makes that a decision rather
+     * than the shortest thing to type.
      *
      * @param record what happened
      * @param previousHash the hash of the preceding node
      * @param hash this node's own hash
+     * @return a node carrying {@link CanonicalEncoder#CURRENT_FORMAT_VERSION}
      */
-    public ChainedRecord(AuditRecord record, String previousHash, String hash) {
-        this(record, previousHash, hash, CanonicalEncoder.CURRENT_FORMAT_VERSION);
+    public static ChainedRecord currentFormat(AuditRecord record, String previousHash, String hash) {
+        return new ChainedRecord(record, previousHash, hash, CanonicalEncoder.CURRENT_FORMAT_VERSION);
     }
 }

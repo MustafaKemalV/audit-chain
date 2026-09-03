@@ -5,7 +5,6 @@ import io.github.mustafakemalv.auditchain.core.ChainedRecord;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
-import java.util.function.Function;
 
 /**
  * Storage SPI for the audit chain. The contract is deliberately append-only: there is no update or
@@ -15,20 +14,30 @@ import java.util.function.Function;
  *
  * <h2>What an implementation must guarantee</h2>
  *
- * <p><b>Unique sequence numbers.</b> This is the one requirement the chain cannot verify for itself
- * and cannot recover from. Two records sharing a sequence number is a forked chain, and every later
- * verification reports it as tampering that never happened. The bundled JDBC store gets this from a
- * primary key on the sequence column; an implementation without an equivalent constraint must reject
- * a duplicate sequence itself, by raising {@link AuditStoreException}. Silently accepting one is the
- * worst failure available to a store, because it corrupts the log while looking like an attack.
+ * <p><b>Sealing is one atomic step.</b> {@link #appendSealed(RecordSealer)} reads the tip, hands it
+ * to the chain to seal a record, and stores the result. Those three cannot be split: two writers
+ * that both read the tip before either has written compute the same sequence number, and one of them
+ * loses its record. That is why there is no plain "store this record" method to implement by
+ * mistake. A store reachable from more than one thread or process must make the whole call
+ * exclusive, typically with a row lock held until the write commits.
  *
- * <p><b>Thread safety.</b> A store is shared and reached from several threads. {@code append} is
- * serialized by the chain, but {@code last}, {@code findAll}, {@code findRange} and {@code count}
- * are not, so they may run while an append is in flight and must not break or return a partially
- * written view.
+ * <p><b>Unique sequence numbers.</b> This is the one failure the chain can neither verify for itself
+ * nor recover from. Two records sharing a sequence is a forked chain, and every later verification
+ * reports it as tampering that never happened. Reject a duplicate with {@link AuditStoreException};
+ * accepting one silently is the worst thing a store can do, because it corrupts the log while
+ * looking like an attack.
+ *
+ * <p><b>A durable high-water mark.</b> {@link #head()} reports how many records the chain has ever
+ * held, and verification compares that against the records actually present. It is the only way to
+ * notice records deleted from the end, because what remains after such a deletion is a shorter but
+ * perfectly valid chain. A store that cannot keep a count outliving its records must say so in its
+ * own documentation, because truncation is then undetectable through it.
+ *
+ * <p><b>Thread safety.</b> A store is shared and reached from several threads. Reads may run while
+ * an append is in flight and must not break or return a partially written view.
  *
  * <p><b>Exception translation.</b> Failures reaching the backend must surface as
- * {@link AuditStoreException}, and a record that comes back corrupt must surface as
+ * {@link AuditStoreException}, and a record that comes back corrupt as
  * {@link MalformedRecordException}. Letting a backend-specific exception escape forces callers to
  * catch the exception type of whichever store happens to be configured, which is precisely what this
  * SPI exists to avoid.
@@ -36,43 +45,56 @@ import java.util.function.Function;
 public interface AuditStore {
 
     /**
-     * Appends {@code record} as the new head of the chain.
+     * Turns the current tip of a chain into the record to store.
      *
-     * @param record the record to store
-     * @throws AuditStoreException if the store cannot be reached or rejects the write, including a
+     * <p>This is where the chain computes the hash, which is why it cannot happen before the tip is
+     * read: the record links to whatever sits at the end of the chain right now.
+     */
+    @FunctionalInterface
+    interface RecordSealer {
+
+        /**
+         * Seals a record against the given tip.
+         *
+         * @param head the current tip of the chain
+         * @return the record to store, taking {@link ChainHead#nextSequence()} as its sequence
+         */
+        ChainedRecord seal(ChainHead head);
+    }
+
+    /**
+     * Reads the tip, seals one record against it, and stores that record, as a single atomic step.
+     *
+     * <p>This is the only way to write, and deliberately not something an implementation can get
+     * half right. Splitting the read from the write is what loses records under concurrency, and a
+     * lock taken around only the write protects nothing, because the tip was read outside it.
+     *
+     * <p>A store backed by a database should run the whole call in one transaction, joining the
+     * caller's if there is one, and take a row lock while reading the tip. Outside a transaction that
+     * lock is released the moment the read finishes and stops protecting anything.
+     *
+     * @param sealer turns the current tip into the record to append
+     * @return the record that was stored
+     * @throws AuditStoreException if the store cannot be reached, or rejects the write, including a
      *     duplicate sequence number
      */
-    void append(ChainedRecord record);
+    ChainedRecord appendSealed(RecordSealer sealer);
 
     /**
-     * The current head (most recently appended record), or empty if the chain has no records.
+     * The tip of the chain: where the next record attaches, and how many records have ever been
+     * appended.
      *
-     * @return the head record, or empty
+     * <p>The record count must survive the records themselves. Deriving it from the rows currently
+     * present makes truncation invisible, because such a count always agrees with whatever is left.
+     *
+     * @return the current tip, or {@link ChainHead#empty()} for a chain never written to
      * @throws AuditStoreException if the store cannot be reached
-     * @throws MalformedRecordException if the stored head cannot be read back
      */
-    Optional<ChainedRecord> last();
-
-    /**
-     * All records in ascending sequence order, as needed to verify the chain.
-     *
-     * <p>This loads the whole chain into memory. It is fine for the sizes most applications reach,
-     * but a long-lived log should be verified with {@link #findRange(long, int)} instead.
-     *
-     * @return every record, oldest first
-     * @throws AuditStoreException if the store cannot be reached
-     * @throws MalformedRecordException if a stored record cannot be read back
-     */
-    List<ChainedRecord> findAll();
+    ChainHead head();
 
     /**
      * A slice of the chain in ascending sequence order, so a long log can be verified in batches
      * without holding all of it in memory.
-     *
-     * <p>The default implementation goes through {@link #findAll()}, which defeats the purpose; a
-     * store backed by a database should replace it with a query that actually limits what it reads.
-     * It exists as a default so that adding this method does not break implementations written
-     * against an earlier version.
      *
      * @param fromSequence lowest sequence number to include
      * @param limit maximum number of records to return, must be positive
@@ -81,95 +103,60 @@ public interface AuditStore {
      * @throws AuditStoreException if the store cannot be reached
      * @throws MalformedRecordException if a stored record cannot be read back
      */
-    default List<ChainedRecord> findRange(long fromSequence, int limit) {
-        if (limit <= 0) {
-            throw new IllegalArgumentException("limit must be positive");
-        }
-        List<ChainedRecord> slice = new ArrayList<>();
-        for (ChainedRecord record : findAll()) {
-            if (record.record().sequence() < fromSequence) {
-                continue;
-            }
-            slice.add(record);
-            if (slice.size() == limit) {
-                break;
-            }
-        }
-        return slice;
-    }
-
-    /**
-     * The tip of the chain: where the next record attaches, and how many records have ever been
-     * appended.
-     *
-     * <p>The default derives it from {@link #last()} and {@link #count()}, which is correct but
-     * cannot notice a truncated chain: a count taken from the rows that remain always agrees with
-     * those rows. A store that can keep a durable high-water mark should do so and report it here,
-     * because that is what turns "records were deleted from the end" from invisible into detectable.
-     *
-     * @param genesisHash the value an empty chain's first record links to
-     * @return the current tip
-     * @throws AuditStoreException if the store cannot be reached
-     */
-    default ChainHead head(String genesisHash) {
-        return last()
-                .map(record -> new ChainHead(record.record().sequence(), record.hash(), count()))
-                .orElseGet(() -> ChainHead.empty(genesisHash));
-    }
-
-    /**
-     * The tip of the chain, read in a way that serializes concurrent appends until the caller's work
-     * is committed.
-     *
-     * <p>A hash chain cannot be built in parallel: a record cannot be sealed until the one before it
-     * is settled, so two appends that both read the same tip will compute the same sequence number
-     * and one of them must lose. A store backed by a database should take a row lock here, which
-     * turns that collision into an orderly queue. The default simply reads, which is right for a
-     * store whose appends are already serialized in memory.
-     *
-     * @param genesisHash the value an empty chain's first record links to
-     * @return the current tip
-     * @throws AuditStoreException if the store cannot be reached
-     */
-    default ChainHead lockHead(String genesisHash) {
-        return head(genesisHash);
-    }
-
-    /**
-     * Seals and stores one record as a single unit of work.
-     *
-     * <p>Reading the tip and writing the record have to be one atomic step. Split apart, two writers
-     * can both read the same tip before either has written, compute the same sequence number, and
-     * one of them loses its record. A row lock alone does not fix that: outside a transaction the
-     * lock is released the moment the read finishes, so the guarantee quietly disappears exactly
-     * when nobody is looking.
-     *
-     * <p>{@code sealer} receives the current tip and returns the record to store, which is where the
-     * chain computes the hash. A store backed by a database should run the whole call in one
-     * transaction, joining the caller's if there is one.
-     *
-     * @param genesisHash the value an empty chain's first record links to
-     * @param sealer turns the current tip into the record to append
-     * @return the record that was stored
-     * @throws AuditStoreException if the store cannot be reached or rejects the write
-     */
-    default ChainedRecord appendSealed(String genesisHash, Function<ChainHead, ChainedRecord> sealer) {
-        ChainHead head = lockHead(genesisHash);
-        ChainedRecord sealed = sealer.apply(head);
-        append(sealed);
-        return sealed;
-    }
+    List<ChainedRecord> findRange(long fromSequence, int limit);
 
     /**
      * Number of records currently stored.
      *
-     * <p>Deliberately not given a default: verification uses this count to notice records missing
-     * from the end of the chain, which is the one kind of tampering the hash links cannot reveal on
-     * their own. A default in terms of {@link #findAll()} would quietly make that check as expensive
-     * as reading the entire log, so each store is asked to answer it properly.
+     * <p>This counts what is actually there, unlike {@link ChainHead#recordCount()}, which remembers
+     * what there has ever been. Verification compares the two, so a store must not answer this from
+     * the same remembered value.
      *
      * @return how many records the store holds
      * @throws AuditStoreException if the store cannot be reached
      */
     long count();
+
+    /**
+     * The most recently appended record, or empty if the chain has none.
+     *
+     * <p>Derived from {@link #head()} and {@link #findRange(long, int)} so it cannot disagree with
+     * them. Override only to save a round trip.
+     *
+     * @return the newest record, or empty
+     * @throws AuditStoreException if the store cannot be reached
+     * @throws MalformedRecordException if the stored record cannot be read back
+     */
+    default Optional<ChainedRecord> last() {
+        ChainHead head = head();
+        if (head.isEmpty()) {
+            return Optional.empty();
+        }
+        List<ChainedRecord> found = findRange(head.lastSequence(), 1);
+        return found.isEmpty() ? Optional.empty() : Optional.of(found.get(0));
+    }
+
+    /**
+     * Every record, oldest first.
+     *
+     * <p>Derived by paging through {@link #findRange(long, int)}, so it holds the whole chain in
+     * memory by definition. Verification does not use it; it is here for callers exporting or
+     * inspecting a chain small enough to fit.
+     *
+     * @return every record, oldest first
+     * @throws AuditStoreException if the store cannot be reached
+     * @throws MalformedRecordException if a stored record cannot be read back
+     */
+    default List<ChainedRecord> findAll() {
+        List<ChainedRecord> all = new ArrayList<>();
+        long from = 0L;
+        while (true) {
+            List<ChainedRecord> page = findRange(from, 1000);
+            if (page.isEmpty()) {
+                return all;
+            }
+            all.addAll(page);
+            from = page.get(page.size() - 1).record().sequence() + 1;
+        }
+    }
 }

@@ -19,9 +19,26 @@ package io.github.mustafakemalv.auditchain.core;
  */
 public record ChainHead(long lastSequence, String lastHash, long recordCount) {
 
+    /**
+     * The hash the first record of any chain links to: 32 zero bytes as hex.
+     *
+     * <p>It lives here rather than on the chain because a store needs it to describe an empty tip,
+     * and passing it in as an argument made every store take a value it could neither own nor vary,
+     * with a way to get it wrong.
+     */
+    public static final String GENESIS_HASH = "0".repeat(64);
+
+    private static final int HASH_LENGTH = 64;
+
     public ChainHead {
         if (lastHash == null) {
             throw new IllegalArgumentException("lastHash is required");
+        }
+        if (!isChainHash(lastHash)) {
+            // A tip carrying something that is not a hash cannot be compared with a record's hash,
+            // so it would fail verification later with a confusing reason instead of here.
+            throw new IllegalArgumentException("lastHash must be " + HASH_LENGTH
+                    + " lowercase hex characters");
         }
         if (lastSequence < -1) {
             throw new IllegalArgumentException("lastSequence must be -1 or above");
@@ -29,16 +46,53 @@ public record ChainHead(long lastSequence, String lastHash, long recordCount) {
         if (recordCount < 0) {
             throw new IllegalArgumentException("recordCount must not be negative");
         }
+        if (lastSequence < 0 && recordCount > 0 && !GENESIS_HASH.equals(lastHash)) {
+            throw new IllegalArgumentException(
+                    "a tip with no last sequence cannot carry a record's hash");
+        }
+    }
+
+    /**
+     * Whether {@code value} has the shape every hash in a chain has: 64 lowercase hex characters.
+     *
+     * @param value the string to check, may be null
+     * @return true if it could be a chain hash
+     */
+    public static boolean isChainHash(String value) {
+        return value != null && isLowercaseHex(value);
+    }
+
+    private static boolean isLowercaseHex(String value) {
+        if (value.length() != HASH_LENGTH) {
+            return false;
+        }
+        for (int i = 0; i < HASH_LENGTH; i++) {
+            char c = value.charAt(i);
+            boolean hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+            if (!hex) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /**
      * The tip of a chain with nothing in it yet.
      *
-     * @param genesisHash the value the first record links to
-     * @return an empty tip
+     * @return an empty tip, linking to {@link #GENESIS_HASH}
      */
-    public static ChainHead empty(String genesisHash) {
-        return new ChainHead(-1L, genesisHash, 0L);
+    public static ChainHead empty() {
+        return new ChainHead(-1L, GENESIS_HASH, 0L);
+    }
+
+    /**
+     * The tip of a chain that has been emptied of records but is known to have held some.
+     *
+     * @param recordCount how many records the chain has ever held
+     * @return a tip with no records but a remembered length
+     */
+    public static ChainHead emptyWithHistory(long recordCount) {
+        return new ChainHead(-1L, GENESIS_HASH, recordCount);
     }
 
     /** @return the sequence number the next appended record takes */

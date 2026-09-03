@@ -7,6 +7,22 @@ package io.github.mustafakemalv.auditchain.core;
  */
 public record VerificationResult(boolean valid, long brokenSequence, FailureReason reason) {
 
+    public VerificationResult {
+        if (reason == null) {
+            throw new IllegalArgumentException("reason is required");
+        }
+        // The javadoc above states what a valid result looks like; without these checks the record
+        // accepted results that contradicted it, and adding the checks after publication would turn
+        // working consumer code into an exception.
+        if (valid && (brokenSequence != -1L || reason != FailureReason.NONE)) {
+            throw new IllegalArgumentException("an intact result cannot name a broken sequence or reason");
+        }
+        if (!valid && reason == FailureReason.NONE) {
+            throw new IllegalArgumentException("a broken result must give a reason");
+        }
+    }
+
+
     public static VerificationResult intact() {
         return new VerificationResult(true, -1L, FailureReason.NONE);
     }
