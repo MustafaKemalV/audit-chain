@@ -35,6 +35,13 @@
 
     <properties>
         <java.version>25</java.version>
+        <!--
+            JDK 23 turned implicit annotation processing off, so spring-boot-configuration-processor
+            silently stopped running and the jar shipped without spring-configuration-metadata.json.
+            Without that file an IDE offers no completion for audit-chain.* and a typo in a property
+            name fails at startup with nothing pointing at the cause.
+        -->
+        <maven.compiler.proc>full</maven.compiler.proc>
     </properties>
 
     <build>

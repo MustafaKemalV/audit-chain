@@ -28,7 +28,7 @@ public class AuditChainProperties {
      * Which DataSource bean the JDBC store should use. Only needed when the application defines more
      * than one; with a single DataSource it is picked up automatically.
      */
-    private String dataSourceBeanName;
+    private String datasourceBeanName;
 
     /**
      * What an {@code @Audited} method does when the audit write itself fails: FAIL lets the failure
@@ -70,12 +70,12 @@ public class AuditChainProperties {
         this.onFailure = onFailure;
     }
 
-    public String getDataSourceBeanName() {
-        return dataSourceBeanName;
+    public String getDatasourceBeanName() {
+        return datasourceBeanName;
     }
 
-    public void setDataSourceBeanName(String dataSourceBeanName) {
-        this.dataSourceBeanName = dataSourceBeanName;
+    public void setDatasourceBeanName(String datasourceBeanName) {
+        this.datasourceBeanName = datasourceBeanName;
     }
 
     public String getChainId() {

@@ -8,9 +8,14 @@ pinpoints exactly where it broke.
 
 ## Features
 
-- **Hash-chained records:** `hash(n) = HMAC-SHA256(key, canonicalBytes(record) ‖ previousHash)`.
-- **`verify()` locates the break** and says why: content changed (`HASH_MISMATCH`), link broken
-  (`BROKEN_LINK`), or a record removed/reordered (`SEQUENCE_GAP`).
+- **Hash-chained records:**
+  `hash(n) = HMAC-SHA256(key, domainTag ‖ chainId ‖ canonicalBytes(record) ‖ previousHash)`, with
+  every part length-prefixed so no combination can be re-split into a different one.
+- **`verify()` locates the break** and says why: content altered (`HASH_MISMATCH`), link rewritten
+  (`BROKEN_LINK`), record removed or reordered (`SEQUENCE_GAP`), records deleted from the end
+  (`TRUNCATED`), or a row that no longer decodes (`UNREADABLE_RECORD`).
+- **Appends do not race.** Writers from several application instances serialize on the chain's head
+  row, so no audit record is lost to a concurrent write.
 - **Deterministic canonical encoding** (binary, length-prefixed, never JSON), so the same record
   always hashes identically across machines and database round-trips.
 - **Two ways to record:** an imperative `AuditChain.append(...)` service and a declarative
@@ -92,11 +97,20 @@ manager). If no key is set, the application fails fast at startup.
 
 ### 2. Create the table
 
-With a `DataSource` present, audit-chain uses a JDBC append-only store. Create the table from
-[`schema.sql`](audit-chain-spring-boot-autoconfigure/src/main/resources/audit-chain/schema.sql) (via Flyway/Liquibase or by hand). To make
-append-only a real guarantee, grant the audit DB role `INSERT` and `SELECT` but **not** `UPDATE` or
-`DELETE`. Without a `DataSource`, audit-chain falls back to an in-memory store (dev only; it logs a
-warning and does not survive a restart).
+With a `DataSource` present, audit-chain uses a JDBC append-only store. Create the tables from
+[`schema.sql`](audit-chain-spring-boot-autoconfigure/src/main/resources/audit-chain/schema.sql)
+(via Flyway/Liquibase or by hand). There are two: `audit_chain` holds the records, and
+`audit_chain_head` holds one row per chain, which is where appends serialize and where the chain's
+length is remembered. The script also seeds that row, which matters: a row lock can only order
+writers if there is a row to lock.
+
+They need different privileges, and the difference is what makes truncation detectable. See
+[Database privileges](#database-privileges).
+
+Without a `DataSource`, audit-chain falls back to an in-memory store (dev only; it logs a warning
+and does not survive a restart). If the application defines several `DataSource` beans and none is
+`@Primary`, startup fails with a message telling you to set `audit-chain.datasource-bean-name`,
+rather than quietly auditing into memory.
 
 ### 3. Record events
 
@@ -158,6 +172,21 @@ Checkpoint anchor = auditChain.head().orElseThrow();
 VerificationResult result = auditChain.verifyAgainstCheckpoint(anchor);
 ```
 
+## Configuration
+
+| Property | Default | What it does |
+| --- | --- | --- |
+| `audit-chain.enabled` | `true` | Turns the whole auto-configuration off |
+| `audit-chain.hmac-key` | none | Base64 HMAC key. Required; startup fails without it |
+| `audit-chain.table-name` | `audit_chain` | The append-only table |
+| `audit-chain.chain-id` | the table name | Bound into every hash, so records cannot be moved between chains sealed with the same key |
+| `audit-chain.datasource-bean-name` | none | Which `DataSource` holds the audit table. Only needed when there is more than one |
+| `audit-chain.on-failure` | `FAIL` | What an `@Audited` method does when the audit write fails: `FAIL` takes the business call down with it, `LOG` records the problem and lets the call succeed unrecorded |
+
+**On `chain-id`:** give each log its own whenever one key covers more than one of them. The default
+follows the table name, so two tables under one key are already kept apart. Reusing an id across two
+logs re-opens the hole it exists to close.
+
 ## How it works
 
 See [docs/how-it-works.md](docs/how-it-works.md) for the canonical encoding, the hash chain, and how
@@ -165,35 +194,108 @@ See [docs/how-it-works.md](docs/how-it-works.md) for the canonical encoding, the
 
 ## Threat model (honest scope)
 
-audit-chain is tamper-**evident**, not tamper-**proof**. It detects tampering by anyone who does
-**not** hold the HMAC key. It does **not** stop an attacker who holds the key or can rewrite the
-whole log consistently (HMAC is symmetric: whoever can verify can also sign). It also does not
-verify *who* an actor is; deriving the correct `actor` is your authentication layer's job. For
-defence beyond keyless tamper-evidence, the library gives you hooks, not guarantees:
+audit-chain is tamper-**evident**, not tamper-**proof**. It does not prevent anyone from changing
+the database; it makes the change show up when the log is verified.
 
-- export the chain head to an **external anchor** (a separate trust domain / transparency log) and
-  check it with `verifyAgainstCheckpoint(...)`,
-- run the store on **WORM / INSERT-only** storage (grant `INSERT`, revoke `UPDATE`/`DELETE`),
-- keep the HMAC key in a **KMS/HSM**, separate from the database.
+### What `verify()` catches
+
+Each of these is covered by a test, and the reason it reports is the one named here.
+
+| Tampering | Reported as |
+| --- | --- |
+| A record's content was edited | `HASH_MISMATCH` |
+| A record was forged and appended | `HASH_MISMATCH` |
+| A record was removed from the start or the middle | `SEQUENCE_GAP` |
+| Records were reordered | `SEQUENCE_GAP` |
+| A link was rewritten to point elsewhere | `BROKEN_LINK` |
+| Records were deleted from the **end**, or the whole log was wiped | `TRUNCATED` |
+| Records from **another chain** were moved in, under the same key | `HASH_MISMATCH` |
+| A row's stored bytes will no longer decode | `UNREADABLE_RECORD` |
+
+The last three are worth spelling out, because a plain hash chain catches none of them.
+
+**Deleting from the end** leaves a shorter but perfectly valid chain, so the hash links cannot see
+it. It is caught by `audit_chain_head`, which remembers how many records the chain has ever held.
+**That protection is worth exactly as much as the grants on that table**: whoever can write there
+can lower the count and hide the deletion. See [Database privileges](#database-privileges).
+
+**Moving records between chains** is caught because `chain-id` is bound into every hash. Without it,
+a genuine and correctly signed history from one log verifies perfectly inside another log sealed
+with the same key, so an incriminating trail could be replaced wholesale with someone else's, no key
+required.
+
+**A row that will not decode** is reported rather than thrown, so a monitoring job that calls
+`verify()` on a schedule alerts instead of crashing.
+
+### What it does not catch
+
+- **An attacker who holds the HMAC key** can rewrite the log consistently and it will verify. HMAC
+  is symmetric: whoever can verify can also sign. The one thing that still catches this is a
+  `Checkpoint` anchored somewhere the attacker does not control, checked with
+  `verifyAgainstCheckpoint(...)`.
+- **An attacker who can also write to `audit_chain_head`** can hide a deletion from the end of the
+  chain, by lowering the remembered count to match what is left.
+- **An action that was never recorded.** The log can only attest to what reached it. If the audit
+  write is skipped, or the code path has no `append` in it, there is nothing to detect.
+- **Whether the actor is who they claim to be.** Deriving a correct `actor` is your authentication
+  layer's job; this library records what it is given.
+- **Anything above the anchor, with a stolen key.** A checkpoint pins the chain up to its own
+  sequence. A rewrite of records after it still verifies, so anchor often if that matters.
+
+### Hardening beyond the defaults
+
+- Anchor the chain head somewhere in a **separate trust domain** and check it with
+  `verifyAgainstCheckpoint(...)`.
+- Run the audit table on **WORM / INSERT-only** storage.
+- Keep the HMAC key in a **KMS/HSM**, out of the database's blast radius.
+- Give `audit_chain_head` its own grants, as below.
+
+## Database privileges
+
+The two tables need different privileges, and the difference is the point.
+
+```sql
+GRANT INSERT, SELECT         ON audit_chain      TO audit_app;
+GRANT INSERT, SELECT, UPDATE ON audit_chain_head TO audit_app;
+```
+
+`audit_chain` is append-only and never needs `UPDATE` or `DELETE`. `audit_chain_head` holds one row
+per chain and does need `UPDATE`, because that row is both where appends serialize and where the
+chain's length is remembered.
+
+Someone who can write to the head row can stall appends and can hide a truncation, but cannot forge
+a record: the hashes still have to line up. Someone who can write to `audit_chain` but not to the
+head row cannot delete the newest records without it showing.
 
 ## Limitations
 
-- **Single writer:** `append` is synchronized, which is correct for one JVM. A distributed
-  deployment needs sequence coordination at the storage layer; the `sequence` primary key turns a
-  race into a failed insert rather than silent corruption.
-- **`verify()` reads the whole chain** into memory. For very large logs, verify in batches (planned).
-- **The chain starts at sequence 0** and is a single monotonic run; log rotation/archival is not
-  supported yet.
-- **`@Audited` records after the method returns, not inside its transaction.** If the surrounding
-  transaction rolls back after a normal return, the record is still written; if the audit write
-  itself fails, the action goes unrecorded. When the audit write must share the business
-  transaction's fate, call the imperative `append(...)` inside that transaction. `@Audited` also
-  records no `details` (use `append(...)` for contextual key/values).
-- **`details` has a size limit.** The encoded map must fit the `details` column (4000 chars by
-  default); the JDBC store rejects oversized details rather than letting the database truncate them
-  and corrupt the chain. On databases that treat the empty string as `NULL` (Oracle), a `""` field
-  would round-trip as `null` and fail verification; use a database that distinguishes them, or avoid
-  empty-string fields.
+- **A chain is serial by nature.** A record cannot be sealed until the one before it is settled, so
+  appends to one chain are processed one at a time. This is a property of hash chains, not an
+  implementation shortcut. Throughput scales by running **several chains**, each with its own
+  `chain-id` and table, rather than by making one chain faster. Measured on PostgreSQL, splitting
+  one log into 8 chains cut wall-clock time for the same work by roughly 7x.
+- **`verify()` reads the whole chain**, in pages rather than all at once, but it still walks every
+  record from the start. It is O(n) in the length of the log, and there is no incremental
+  verification from a trusted point yet.
+- **The chain starts at sequence 0** and is a single monotonic run. Log rotation and archival are
+  not supported.
+- **`@Audited` writes inside the caller's transaction**, just before it commits, so a rolled-back
+  transaction leaves no record. This is deliberate: an audit entry saying an action happened when
+  the transaction rolled back is a lie, and a lie is worse than a gap. To record attempts that were
+  rolled back, call `append(...)` yourself from a `@Transactional(propagation = REQUIRES_NEW)`
+  method. `@Audited` also records no `details`; use `append(...)` for contextual key/values.
+- **Only proxied calls are audited.** A call from inside the same bean, and `private`, `final` or
+  `static` methods, are not recorded. This is the usual Spring proxying caveat.
+- **`@Audited` expressions need `-parameters`.** Without it `#id` resolves to `null` and every
+  record loses its resource id. The library logs a warning once per method when it detects this;
+  Spring Boot's own parent POM enables the flag.
+- **Column limits are enforced before insert.** `details` must fit 4000 characters encoded, and
+  `actor`, `action`, `resourceType` and `resourceId` must fit 255. Oversized values are rejected
+  rather than left to a database that would silently truncate them, because a truncated value no
+  longer re-hashes to its stored hash and would report as tampering forever.
+- **Empty strings on Oracle.** A database that treats `''` as `NULL` will round-trip an empty field
+  as `null` and fail verification. Use a database that distinguishes them, or avoid empty-string
+  fields.
 
 ## License
 

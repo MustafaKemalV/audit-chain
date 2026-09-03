@@ -50,7 +50,7 @@ public class AuditChainAutoConfiguration {
 
     private static DataSource resolveDataSource(AuditChainProperties properties,
             ObjectProvider<DataSource> dataSources, BeanFactory beanFactory) {
-        String configured = properties.getDataSourceBeanName();
+        String configured = properties.getDatasourceBeanName();
         if (configured != null && !configured.isBlank()) {
             return beanFactory.getBean(configured.strip(), DataSource.class);
         }
