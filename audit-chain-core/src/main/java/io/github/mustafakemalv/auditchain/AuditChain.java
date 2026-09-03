@@ -36,12 +36,15 @@ import java.util.Optional;
  * access to another could replace a damning history with a genuine, correctly signed one. Give each
  * chain its own id whenever one key covers more than one log.
  *
- * <p><b>Concurrency.</b> {@link #append(AuditEvent)} is synchronized, which serializes appends made
- * through this instance. That is not the whole story once appends run inside database transactions,
- * where the insert stays invisible until commit; see the store's documentation. Note also that a
- * hash chain is serial by nature, because a record cannot be sealed until the one before it is
- * committed. Throughput therefore scales by running several chains, each with its own id and table,
- * rather than by making one chain faster.
+ * <p><b>Concurrency.</b> Appends are serialized by the store, not here. This class holds no lock of
+ * its own: it used to, and combining a lock released on return with a database row lock held until
+ * commit produced a deadlock between two appends in one transaction, which the JVM's own detector
+ * cannot even see because half the cycle lives in the database. The store is the only place that can
+ * serialize correctly, because only it knows when the write is durable.
+ *
+ * <p>A hash chain is serial by nature: a record cannot be sealed until the one before it is settled.
+ * Throughput therefore scales by running several chains, each with its own id and table, rather than
+ * by making one chain faster.
  */
 public final class AuditChain {
 
@@ -67,12 +70,6 @@ public final class AuditChain {
      * which is a guaranteed out-of-memory failure on a chain that has been running for years.
      */
     private static final int VERIFY_PAGE_SIZE = 1000;
-
-    /**
-     * Guards append against itself. Deliberately not the instance monitor: with a public
-     * synchronized method any consumer could hold the lock and stall every audit write in the JVM.
-     */
-    private final Object appendLock = new Object();
 
     private final byte[] key;
     private final AuditStore store;
@@ -138,9 +135,7 @@ public final class AuditChain {
         // Handing the whole step to the store keeps reading the tip and writing the record in one
         // unit of work. Doing it here as two calls would let two writers read the same tip and
         // compute the same sequence number, and one of their records would be lost.
-        synchronized (appendLock) {
-            return store.appendSealed(head -> seal(head, event));
-        }
+        return store.appendSealed(head -> seal(head, event));
     }
 
     /** Builds the record that attaches to {@code head}. Called by the store, under its lock. */
@@ -170,9 +165,7 @@ public final class AuditChain {
         if (event == null) {
             throw new IllegalArgumentException("event is required");
         }
-        synchronized (appendLock) {
-            return store.appendSealedIndependently(head -> seal(head, event));
-        }
+        return store.appendSealedIndependently(head -> seal(head, event));
     }
 
     /**

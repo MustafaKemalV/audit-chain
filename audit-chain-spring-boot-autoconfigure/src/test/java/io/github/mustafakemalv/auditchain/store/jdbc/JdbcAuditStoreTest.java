@@ -21,6 +21,9 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.LongStream;
+import org.springframework.jdbc.datasource.DataSourceTransactionManager;
+import org.springframework.transaction.support.TransactionTemplate;
+import java.util.concurrent.TimeoutException;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -321,5 +324,48 @@ class JdbcAuditStoreTest {
         chain.append(AuditEvent.of(atLimit, "login", atLimit, atLimit));
 
         assertThat(chain.verify().valid()).isTrue();
+    }
+
+    @Test
+    void twoAppendsInOneTransactionDoNotDeadlock() throws Exception {
+        // The shape the README's own example produces: two audited calls in one business
+        // transaction, with another request auditing at the same time. A chain-level monitor plus a
+        // database row lock had opposite lifetimes here, the monitor released on return and the row
+        // lock held until commit, so the two threads waited on each other. The JVM's deadlock
+        // detector cannot see it either, because half the cycle lives in the database.
+        TransactionTemplate tx = new TransactionTemplate(new DataSourceTransactionManager(database));
+        AuditChain chain = newChain();
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        CountDownLatch firstAppendDone = new CountDownLatch(1);
+
+        Future<?> holder = pool.submit(() -> tx.executeWithoutResult(status -> {
+            chain.append(AuditEvent.of("t1", "first"));
+            firstAppendDone.countDown();
+            sleepBriefly();
+            chain.append(AuditEvent.of("t1", "second"));
+        }));
+        assertThat(firstAppendDone.await(10, TimeUnit.SECONDS)).isTrue();
+        Future<?> other = pool.submit(() -> tx.executeWithoutResult(status ->
+                chain.append(AuditEvent.of("t2", "concurrent"))));
+
+        try {
+            holder.get(20, TimeUnit.SECONDS);
+            other.get(20, TimeUnit.SECONDS);
+        } catch (TimeoutException e) {
+            throw new AssertionError("appends deadlocked: neither transaction finished", e);
+        } finally {
+            pool.shutdownNow();
+        }
+
+        assertThat(store.count()).isEqualTo(3L);
+        assertThat(chain.verify().valid()).isTrue();
+    }
+
+    private static void sleepBriefly() {
+        try {
+            Thread.sleep(300);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
     }
 }
