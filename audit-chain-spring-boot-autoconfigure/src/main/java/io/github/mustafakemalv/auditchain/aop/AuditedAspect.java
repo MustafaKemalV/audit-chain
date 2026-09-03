@@ -17,8 +17,6 @@ import org.springframework.expression.Expression;
 import org.springframework.expression.ExpressionParser;
 import org.springframework.expression.spel.standard.SpelExpressionParser;
 import org.springframework.expression.spel.support.SimpleEvaluationContext;
-import org.springframework.transaction.support.TransactionSynchronization;
-import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 /**
  * Turns a successful call to an {@link Audited} method into an audit record. Literals come from the
@@ -27,18 +25,18 @@ import org.springframework.transaction.support.TransactionSynchronizationManager
  *
  * <h2>When the record is written</h2>
  *
- * <p>The record is written inside the caller's transaction, just before it commits, so the audit
- * entry and the business data are committed together or not at all. An audit log that says an action
- * happened when the transaction rolled back is lying, and a lie is worse than a gap.
+ * <p>The record is written as soon as the method returns. If that happens inside the caller's
+ * transaction, which is the normal arrangement, the audit entry and the business data commit
+ * together or not at all, and a rolled-back transaction leaves no record. An audit log that says an
+ * action happened when the transaction rolled back is lying, and a lie is worse than a gap.
  *
- * <p>This is done by hooking the transaction rather than by advice ordering, which cannot express it:
- * for the audit to run inside the transaction, this aspect would have to sit deeper than Spring's
- * transaction advisor, whose order is already {@code Integer.MAX_VALUE}. Left to ordering the two are
- * a tie broken by bean discovery, so the same library could audit inside the transaction in one
- * application and outside it in another. Registering a transaction synchronization removes the
- * question: wherever this aspect ends up in the advice chain, the write happens before commit.
+ * <p>Whether this aspect runs inside the transaction is decided by advice ordering, and cannot be
+ * forced from here: this aspect would have to sit deeper than Spring's transaction advisor, whose
+ * order is already {@code Integer.MAX_VALUE}. In practice the transaction interceptor is the outer
+ * one and the record joins the transaction. Where that matters to you, assert it: an audit write
+ * that fails should take the business call down with it.
  *
- * <p>With no transaction in progress the record is written immediately.
+ * <p>With no transaction in progress the record is simply written.
  *
  * <p>To record attempts that were rolled back, call {@link AuditChain#append} yourself from a method
  * annotated {@code @Transactional(propagation = REQUIRES_NEW)}; that is deliberately not what this
@@ -104,27 +102,23 @@ public class AuditedAspect {
         AuditEvent event = new AuditEvent(
                 actorProvider.currentActor(), audited.action(), resourceType, resourceId, Map.of());
 
-        if (TransactionSynchronizationManager.isSynchronizationActive()) {
-            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
-                @Override
-                public void beforeCommit(boolean readOnly) {
-                    write(event);
-                }
-            });
-            return;
-        }
         write(event);
     }
 
     private void write(AuditEvent event) {
-        try {
+        if (failureMode == AuditFailureMode.FAIL) {
             auditChain.append(event);
+            return;
+        }
+        try {
+            // LOG mode writes independently on purpose. Swallowing the exception is not enough on
+            // its own: a failure inside the caller's transaction marks it rollback-only, so the
+            // business work is lost anyway and the log line claiming "the action succeeded" would be
+            // false. Writing outside that transaction is what makes the mode mean what it says.
+            auditChain.appendIndependently(event);
         } catch (RuntimeException e) {
-            if (failureMode == AuditFailureMode.FAIL) {
-                throw e;
-            }
             log.error("audit-chain: could not record " + event.action()
-                    + "; the action succeeded but is not in the audit log", e);
+                    + "; the action was not affected but is not in the audit log", e);
         }
     }
 

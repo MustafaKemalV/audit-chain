@@ -81,6 +81,22 @@ public interface AuditStore {
     ChainedRecord appendSealed(RecordSealer sealer);
 
     /**
+     * Seals and stores one record in a transaction of its own, whatever the caller is doing.
+     *
+     * <p>The default delegates to {@link #appendSealed(RecordSealer)}, which is correct for any
+     * store that does not take part in transactions: there, every write is already independent. A
+     * transactional store must override this, or a caller asking for independence will silently not
+     * get it.
+     *
+     * @param sealer turns the current tip into the record to append
+     * @return the record that was stored
+     * @throws AuditStoreException if the store cannot be reached or rejects the write
+     */
+    default ChainedRecord appendSealedIndependently(RecordSealer sealer) {
+        return appendSealed(sealer);
+    }
+
+    /**
      * The tip of the chain: where the next record attaches, and how many records have ever been
      * appended.
      *

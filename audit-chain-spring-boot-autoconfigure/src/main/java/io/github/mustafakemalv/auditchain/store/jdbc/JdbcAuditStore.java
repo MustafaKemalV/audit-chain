@@ -17,6 +17,9 @@ import org.springframework.dao.EmptyResultDataAccessException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.jdbc.datasource.DataSourceTransactionManager;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.TransactionDefinition;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.transaction.support.TransactionTemplate;
 
 /**
@@ -68,6 +71,8 @@ public class JdbcAuditStore implements AuditStore {
     private final String tableName;
     private final String headTableName;
     private final TransactionTemplate transactionTemplate;
+    /** Used when the caller's transaction cannot accept a write; see {@link #appendSealed}. */
+    private final TransactionTemplate independentTransactionTemplate;
 
     /**
      * Creates a store over {@code tableName}.
@@ -78,7 +83,7 @@ public class JdbcAuditStore implements AuditStore {
      *     identifier
      */
     public JdbcAuditStore(JdbcTemplate jdbcTemplate, String tableName) {
-        this(jdbcTemplate, tableName, DEFAULT_HEAD_TABLE);
+        this(jdbcTemplate, tableName, DEFAULT_HEAD_TABLE, null);
     }
 
     /**
@@ -91,6 +96,20 @@ public class JdbcAuditStore implements AuditStore {
      *     identifier
      */
     public JdbcAuditStore(JdbcTemplate jdbcTemplate, String tableName, String headTableName) {
+        this(jdbcTemplate, tableName, headTableName, null);
+    }
+
+    /**
+     * Creates a store over {@code tableName}, tracking its tip in {@code headTableName}.
+     *
+     * @param jdbcTemplate the template to run statements through
+     * @param tableName the audit table, which must be a plain identifier
+     * @param headTableName the table holding one tip row per audit table
+     * @throws IllegalArgumentException if the template is null or either name is not a plain
+     *     identifier
+     */
+    public JdbcAuditStore(JdbcTemplate jdbcTemplate, String tableName, String headTableName,
+            PlatformTransactionManager transactionManager) {
         if (jdbcTemplate == null) {
             throw new IllegalArgumentException("jdbcTemplate is required");
         }
@@ -105,12 +124,27 @@ public class JdbcAuditStore implements AuditStore {
         this.jdbcTemplate = jdbcTemplate;
         this.tableName = tableName;
         this.headTableName = headTableName;
+        // Prefer the application's own transaction manager. Building one here from the DataSource
+        // looks equivalent and is not: Spring joins an existing transaction only when it finds a
+        // connection bound under that same DataSource object, so a JTA setup, a JPA manager with no
+        // DataSource set, or a proxy-wrapped one would silently start a SECOND transaction on a
+        // second connection. The audit record would then commit before the business data and survive
+        // its rollback, which is the one thing this library promises cannot happen.
+        PlatformTransactionManager resolved = transactionManager;
+        if (resolved == null) {
+            if (jdbcTemplate.getDataSource() == null) {
+                throw new IllegalArgumentException(
+                        "jdbcTemplate has no DataSource, so appends could not be made atomic");
+            }
+            resolved = new DataSourceTransactionManager(jdbcTemplate.getDataSource());
+        }
         // Default propagation joins the caller's transaction when there is one and starts its own
-        // when there is not. That second case is what matters: outside a transaction the row lock
-        // taken while reading the tip would be released immediately and protect nothing.
-        this.transactionTemplate = jdbcTemplate.getDataSource() == null
-                ? null
-                : new TransactionTemplate(new DataSourceTransactionManager(jdbcTemplate.getDataSource()));
+        // when there is not. That second case matters: outside a transaction the row lock taken
+        // while reading the tip is released immediately and protects nothing.
+        this.transactionTemplate = new TransactionTemplate(resolved);
+        this.independentTransactionTemplate = new TransactionTemplate(resolved);
+        this.independentTransactionTemplate.setPropagationBehavior(
+                TransactionDefinition.PROPAGATION_REQUIRES_NEW);
     }
 
     @Override
@@ -118,12 +152,40 @@ public class JdbcAuditStore implements AuditStore {
         if (sealer == null) {
             throw new IllegalArgumentException("sealer is required");
         }
-        return transactionTemplate.execute(status -> {
-            ChainHead head = readHead(true);
-            ChainedRecord sealed = sealer.seal(head);
-            insert(sealed);
-            return sealed;
-        });
+        // A read-only transaction cannot carry this write at all: the database refuses both the row
+        // lock and the insert. Auditing a read ("who viewed this record") is a normal thing to want,
+        // so the write goes into its own transaction rather than failing. It could not share the
+        // reader's fate anyway, because a read has no fate to share.
+        if (TransactionSynchronizationManager.isCurrentTransactionReadOnly()) {
+            return appendSealedIndependently(sealer);
+        }
+        return transactionTemplate.execute(status -> sealAndInsert(sealer));
+    }
+
+    /**
+     * Seals and stores a record in a transaction of its own, whatever the caller is doing.
+     *
+     * <p>Used where the audit write must not be able to affect the caller's transaction, which is
+     * the deliberate trade in {@code audit-chain.on-failure=LOG}: the record no longer shares the
+     * business operation's fate in either direction.
+     *
+     * @param sealer turns the current tip into the record to append
+     * @return the record that was stored
+     */
+    @Override
+    public ChainedRecord appendSealedIndependently(RecordSealer sealer) {
+        if (sealer == null) {
+            throw new IllegalArgumentException("sealer is required");
+        }
+        return independentTransactionTemplate.execute(status -> sealAndInsert(sealer));
+    }
+
+    /** The write itself, always called with a transaction already in progress. */
+    private ChainedRecord sealAndInsert(RecordSealer sealer) {
+        ChainHead head = readHead(true);
+        ChainedRecord sealed = sealer.seal(head);
+        insert(sealed);
+        return sealed;
     }
 
     /**

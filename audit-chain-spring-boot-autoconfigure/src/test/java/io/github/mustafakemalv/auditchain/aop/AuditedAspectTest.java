@@ -18,11 +18,14 @@ import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.EnableAspectJAutoProxy;
+import io.github.mustafakemalv.auditchain.store.jdbc.JdbcAuditStore;
+import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.DataSourceTransactionManager;
 import org.springframework.jdbc.datasource.embedded.EmbeddedDatabaseBuilder;
 import org.springframework.jdbc.datasource.embedded.EmbeddedDatabaseType;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.annotation.EnableTransactionManagement;
+import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.interceptor.TransactionAspectSupport;
 
@@ -182,8 +185,28 @@ class AuditedAspectTest {
         }
 
         @Bean
+        JdbcTemplate jdbcTemplate(DataSource dataSource) {
+            return new JdbcTemplate(dataSource);
+        }
+
+        @Bean
         TransactionalService transactionalService() {
             return new TransactionalService();
+        }
+
+        @Bean
+        ReadOnlyService readOnlyService() {
+            return new ReadOnlyService();
+        }
+
+        @Bean
+        InnerService innerService() {
+            return new InnerService();
+        }
+
+        @Bean
+        NestedService nestedService(InnerService inner) {
+            return new NestedService(inner);
         }
     }
 
@@ -207,6 +230,11 @@ class AuditedAspectTest {
     static class BrokenStoreConfig {
 
         @Bean
+        CountingService countingService() {
+            return new CountingService();
+        }
+
+        @Bean
         AuditStore auditStore() {
             return new InMemoryAuditStore() {
                 @Override
@@ -214,6 +242,127 @@ class AuditedAspectTest {
                     throw new AuditStoreException("the database is on fire");
                 }
             };
+        }
+    }
+
+    @Test
+    void aReadOnlyTransactionStillRecordsTheRead() {
+        // Auditing a read ("who viewed this record") is a normal requirement, and a read-only
+        // transaction cannot carry the write: the database refuses both the row lock and the insert.
+        // The write therefore goes into a transaction of its own, which costs nothing here because a
+        // read has no fate for the record to share.
+        transactionalRunner().withUserConfiguration(RecordingStoreConfig.class).run(context -> {
+            context.getBean(ReadOnlyService.class).view("42");
+
+            RecordingStore store = context.getBean(RecordingStore.class);
+            assertThat(store.count()).isEqualTo(1L);
+            assertThat(store.independentWrites).as("written outside the read-only transaction").isEqualTo(1);
+        });
+    }
+
+    @Test
+    void aRolledBackSavepointLeavesNoRecord() {
+        // The audit write joins the caller's transaction, so it is subject to savepoints like any
+        // other write. An earlier version deferred the write to beforeCommit, which is not scoped to
+        // savepoints, so work that had been rolled back was still recorded as having happened.
+        transactionalRunner().run(context -> {
+            context.getBean(NestedService.class).outerThatRollsBackItsInnerWork();
+
+            assertThat(context.getBean(AuditStore.class).count())
+                    .as("the inner work was undone, so nothing should attest to it")
+                    .isZero();
+        });
+    }
+
+    @Test
+    void logModeKeepsTheBusinessWorkWhenTheAuditWriteFails() {
+        // Swallowing the exception is not enough on its own: a failure inside the caller's
+        // transaction marks it rollback-only, so the business work would be lost anyway and the log
+        // line claiming the action succeeded would be false.
+        runner.withUserConfiguration(BrokenStoreConfig.class)
+                .withPropertyValues("audit-chain.on-failure=log")
+                .run(context -> {
+                    CountingService service = context.getBean(CountingService.class);
+                    service.doWork();
+
+                    assertThat(service.isCompleted()).as("the business call ran to completion").isTrue();
+                });
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    static class RecordingStoreConfig {
+
+        @Bean
+        RecordingStore auditStore(JdbcTemplate jdbcTemplate, PlatformTransactionManager transactionManager) {
+            return new RecordingStore(jdbcTemplate, transactionManager);
+        }
+    }
+
+    /** Counts which write path the chain took, so the test can assert the transaction decision. */
+    static class RecordingStore extends JdbcAuditStore {
+
+        int independentWrites;
+
+        RecordingStore(JdbcTemplate jdbcTemplate, PlatformTransactionManager transactionManager) {
+            super(jdbcTemplate, "audit_chain", JdbcAuditStore.DEFAULT_HEAD_TABLE, transactionManager);
+        }
+
+        @Override
+        public ChainedRecord appendSealedIndependently(RecordSealer sealer) {
+            independentWrites++;
+            return super.appendSealedIndependently(sealer);
+        }
+    }
+
+    static class ReadOnlyService {
+
+        @Transactional(readOnly = true)
+        @Audited(action = "record.viewed", resourceType = "user", resourceId = "#id")
+        public void view(String id) {
+            // a read that still has to be recorded
+        }
+    }
+
+    static class NestedService {
+
+        private final InnerService inner;
+
+        NestedService(InnerService inner) {
+            this.inner = inner;
+        }
+
+        @Transactional
+        public void outerThatRollsBackItsInnerWork() {
+            try {
+                inner.auditedThenRollBack();
+            } catch (RuntimeException ignored) {
+                // the savepoint rollback is the point of the test
+            }
+        }
+    }
+
+    static class InnerService {
+
+        @Transactional(propagation = Propagation.NESTED)
+        @Audited(action = "nested.op")
+        public void auditedThenRollBack() {
+            TransactionAspectSupport.currentTransactionStatus().setRollbackOnly();
+        }
+    }
+
+    static class CountingService {
+
+        private boolean completed;
+
+        @Transactional
+        @Audited(action = "counted.op")
+        public void doWork() {
+            completed = true;
+        }
+
+        /** Read through a method: a CGLIB proxy does not expose the target's fields. */
+        public boolean isCompleted() {
+            return completed;
         }
     }
 }

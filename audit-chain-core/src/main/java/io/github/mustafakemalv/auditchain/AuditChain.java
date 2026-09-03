@@ -135,25 +135,44 @@ public final class AuditChain {
         if (event == null) {
             throw new IllegalArgumentException("event is required");
         }
-        synchronized (appendLock) {
-            return sealAndStore(event);
-        }
-    }
-
-    private ChainedRecord sealAndStore(AuditEvent event) {
         // Handing the whole step to the store keeps reading the tip and writing the record in one
         // unit of work. Doing it here as two calls would let two writers read the same tip and
         // compute the same sequence number, and one of their records would be lost.
-        return store.appendSealed(head -> {
-            long sequence = head.nextSequence();
-            String previousHash = head.lastHash();
-            Instant timestamp = clock.instant(); // AuditRecord truncates to millis
-            AuditRecord record = new AuditRecord(sequence, timestamp, event.actor(), event.action(),
-                    event.resourceType(), event.resourceId(), event.details());
-            int formatVersion = CanonicalEncoder.CURRENT_FORMAT_VERSION;
-            String hash = computeHash(record, previousHash, formatVersion);
-            return new ChainedRecord(record, previousHash, hash, formatVersion);
-        });
+        synchronized (appendLock) {
+            return store.appendSealed(head -> seal(head, event));
+        }
+    }
+
+    /** Builds the record that attaches to {@code head}. Called by the store, under its lock. */
+    private ChainedRecord seal(ChainHead head, AuditEvent event) {
+        long sequence = head.nextSequence();
+        String previousHash = head.lastHash();
+        Instant timestamp = clock.instant(); // AuditRecord truncates to millis
+        AuditRecord record = new AuditRecord(sequence, timestamp, event.actor(), event.action(),
+                event.resourceType(), event.resourceId(), event.details());
+        int formatVersion = CanonicalEncoder.CURRENT_FORMAT_VERSION;
+        String hash = computeHash(record, previousHash, formatVersion);
+        return new ChainedRecord(record, previousHash, hash, formatVersion);
+    }
+
+    /**
+     * Appends {@code event} in a transaction of its own, so it neither rolls back with the caller's
+     * work nor can fail it.
+     *
+     * <p>Use this to record something whose fate is deliberately separate from the surrounding
+     * operation: an attempt that was rolled back, or a read that has no transaction to share. It
+     * gives up the guarantee that {@link #append(AuditEvent)} provides, so reach for it knowingly.
+     *
+     * @param event what happened
+     * @return the record as it was stored
+     */
+    public ChainedRecord appendIndependently(AuditEvent event) {
+        if (event == null) {
+            throw new IllegalArgumentException("event is required");
+        }
+        synchronized (appendLock) {
+            return store.appendSealedIndependently(head -> seal(head, event));
+        }
     }
 
     /**

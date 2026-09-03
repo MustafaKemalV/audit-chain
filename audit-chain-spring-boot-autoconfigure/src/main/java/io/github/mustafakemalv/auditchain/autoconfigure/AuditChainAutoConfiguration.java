@@ -19,6 +19,7 @@ import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.transaction.PlatformTransactionManager;
 
 /**
  * Auto-configures an {@link AuditChain}. If the application defines no {@link AuditStore}, one is
@@ -39,10 +40,22 @@ public class AuditChainAutoConfiguration {
     @Bean
     @ConditionalOnMissingBean(AuditStore.class)
     AuditStore auditStore(AuditChainProperties properties, ObjectProvider<DataSource> dataSources,
-            BeanFactory beanFactory) {
+            ObjectProvider<PlatformTransactionManager> transactionManagers, BeanFactory beanFactory) {
         DataSource resolved = resolveDataSource(properties, dataSources, beanFactory);
         if (resolved != null) {
-            return new JdbcAuditStore(new JdbcTemplate(resolved), properties.getTableName());
+            // The application's own transaction manager, not one built here from the DataSource.
+            // Spring joins an existing transaction only through the manager that started it, so
+            // constructing our own would silently open a second transaction under JTA, JPA without a
+            // DataSource, or a proxy-wrapped one, and the audit record would then outlive a rolled
+            // back business operation.
+            PlatformTransactionManager transactionManager = transactionManagers.getIfUnique();
+            if (transactionManager == null && transactionManagers.stream().findAny().isPresent()) {
+                log.warn("audit-chain: several PlatformTransactionManager beans are defined and none "
+                        + "is marked @Primary, so audit writes will manage their own transactions and "
+                        + "may not share the fate of the business operation they record.");
+            }
+            return new JdbcAuditStore(new JdbcTemplate(resolved), properties.getTableName(),
+                    JdbcAuditStore.DEFAULT_HEAD_TABLE, transactionManager);
         }
         log.warn("audit-chain: no DataSource found, falling back to an in-memory store. Records will "
                 + "NOT survive a restart; configure a DataSource for durable auditing.");
