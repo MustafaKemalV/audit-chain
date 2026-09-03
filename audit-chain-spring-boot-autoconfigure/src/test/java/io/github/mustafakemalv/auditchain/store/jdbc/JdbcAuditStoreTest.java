@@ -287,4 +287,38 @@ class JdbcAuditStoreTest {
         assertThat(store.findAll().stream().map(r -> r.record().sequence()).toList())
                 .isEqualTo(LongStream.range(0, total).boxed().toList());
     }
+
+    @Test
+    void rejectsOversizedStringsBeforeTheDatabaseCanTruncateThem() {
+        // The guard that already existed for details, applied to the columns it was missing from.
+        // On a non-strict database an over-long actor is silently cut down, the row stops re-hashing
+        // to its stored hash, and the chain reports as tampered with forever.
+        AuditChain chain = newChain();
+        String tooLong = "a".repeat(256);
+
+        assertThatThrownBy(() -> chain.append(AuditEvent.of(tooLong, "login")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("actor");
+        assertThatThrownBy(() -> chain.append(AuditEvent.of("alice", tooLong)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("action");
+        assertThatThrownBy(() -> chain.append(AuditEvent.of("alice", "login", tooLong, "1")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("resourceType");
+        assertThatThrownBy(() -> chain.append(AuditEvent.of("alice", "login", "user", tooLong)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("resourceId");
+
+        assertThat(store.count()).as("nothing was written").isZero();
+    }
+
+    @Test
+    void acceptsStringsExactlyAtTheColumnLimit() {
+        AuditChain chain = newChain();
+        String atLimit = "a".repeat(255);
+
+        chain.append(AuditEvent.of(atLimit, "login", atLimit, atLimit));
+
+        assertThat(chain.verify().valid()).isTrue();
+    }
 }

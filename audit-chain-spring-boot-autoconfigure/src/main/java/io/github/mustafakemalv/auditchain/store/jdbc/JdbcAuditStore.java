@@ -46,6 +46,9 @@ public class JdbcAuditStore implements AuditStore {
     /** Default name of the table holding one tip row per audit table. */
     public static final String DEFAULT_HEAD_TABLE = "audit_chain_head";
 
+    /** Width of the VARCHAR columns holding actor, action, resource type and resource id. */
+    private static final int MAX_STRING_LENGTH = 255;
+
     private static final RowMapper<ChainedRecord> ROW_MAPPER = (rs, rowNum) -> {
         AuditRecord record = new AuditRecord(
                 rs.getLong("sequence"),
@@ -128,12 +131,18 @@ public class JdbcAuditStore implements AuditStore {
     public void append(ChainedRecord record) {
         AuditRecord r = record.record();
         String encodedDetails = DetailsCodec.encode(r.details());
-        // Fail fast instead of letting a non-strict database silently truncate the column, which
-        // would make the stored bytes no longer decode to the hashed map and corrupt the chain.
+        // Fail fast instead of letting a non-strict database silently truncate a column. A truncated
+        // value no longer re-hashes to the stored hash, so the record reports as tampered with from
+        // then on, permanently and indistinguishably from a real attack. MySQL outside strict mode
+        // does exactly this without a word.
         if (encodedDetails.length() > MAX_DETAILS_LENGTH) {
             throw new IllegalArgumentException(
                     "encoded details exceed the " + MAX_DETAILS_LENGTH + "-character column limit");
         }
+        checkLength("actor", r.actor());
+        checkLength("action", r.action());
+        checkLength("resourceType", r.resourceType());
+        checkLength("resourceId", r.resourceId());
         try {
             jdbcTemplate.update(
                     "INSERT INTO " + tableName + " (sequence, format_version, timestamp_ms, actor,"
@@ -165,6 +174,13 @@ public class JdbcAuditStore implements AuditStore {
             // Includes the duplicate-sequence case: two appends raced and this one lost. The SPI
             // requires that to be an error rather than a second record on the same sequence.
             throw new AuditStoreException("could not append audit record " + r.sequence(), e);
+        }
+    }
+
+    private static void checkLength(String field, String value) {
+        if (value != null && value.length() > MAX_STRING_LENGTH) {
+            throw new IllegalArgumentException(field + " is " + value.length() + " characters, above the "
+                    + MAX_STRING_LENGTH + "-character column limit");
         }
     }
 
