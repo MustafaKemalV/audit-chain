@@ -83,10 +83,19 @@ class AuditChainAutoConfigurationTest {
     }
 
     @Test
-    void chainIdDefaultsToTheSameValueThePlainConstructorUses() {
-        // One default, not two. The chain id is inside the hash, so a chain written with the plain
-        // constructor while prototyping has to keep verifying once the starter takes over.
+    void aSecondTableIsASecondChainWithoutConfiguration() {
+        // Two logs under one key must not share an identity: whichever chain is sealed with the same
+        // id accepts the other's records wholesale, verifying clean and with no key required.
         runner.withPropertyValues("audit-chain.hmac-key=" + KEY_B64, "audit-chain.table-name=payments_audit")
+                .run(context -> assertThat(context.getBean(AuditChain.class).chainId())
+                        .isEqualTo("payments_audit"));
+    }
+
+    @Test
+    void theDefaultTableAgreesWithThePlainConstructor() {
+        // The chain id is inside the hash, so a chain written with the plain constructor while
+        // prototyping has to keep verifying once the starter takes over.
+        runner.withPropertyValues("audit-chain.hmac-key=" + KEY_B64)
                 .run(context -> assertThat(context.getBean(AuditChain.class).chainId())
                         .isEqualTo(AuditChain.DEFAULT_CHAIN_ID));
     }
@@ -104,11 +113,12 @@ class AuditChainAutoConfigurationTest {
     }
 
     @Test
-    void aBlankChainIdFallsBackToTheDefault() {
+    void aBlankChainIdFallsBackToTheTableName() {
         AuditChainProperties properties = new AuditChainProperties();
+        properties.setTableName("payments_audit");
         properties.setChainId("");
 
-        assertThat(properties.resolveChainId()).isEqualTo(AuditChain.DEFAULT_CHAIN_ID);
+        assertThat(properties.resolveChainId()).isEqualTo("payments_audit");
     }
 
     @Test

@@ -55,8 +55,16 @@ public final class AuditChain {
      */
     public static final String GENESIS_PREVIOUS_HASH = ChainHead.GENESIS_HASH;
 
-    /** The chain id used when none is given. */
-    public static final String DEFAULT_CHAIN_ID = "default";
+    /**
+     * The chain id used when none is given, chosen to equal the default audit table name so the
+     * plain constructor and the Spring starter agree out of the box.
+     *
+     * <p>Two logs under one key must not share an id: whichever chain is sealed with the same id
+     * accepts the other's records wholesale. The starter therefore derives the id from the table
+     * name, and a second table gets a second identity without anyone configuring it. Keep that
+     * property if you construct chains yourself: pass a distinct id per log.
+     */
+    public static final String DEFAULT_CHAIN_ID = "audit_chain";
 
     /**
      * Separates this construction from any other use of the same key. Bump the suffix if the shape

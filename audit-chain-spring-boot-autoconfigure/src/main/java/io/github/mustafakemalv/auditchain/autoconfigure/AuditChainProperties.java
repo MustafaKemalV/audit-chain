@@ -19,9 +19,10 @@ public class AuditChainProperties {
 
     /**
      * Identity bound into every hash, so records cannot be moved between chains sealed with the same
-     * key. Defaults to {@code default}, the same value the plain constructor uses, so a chain
-     * written while prototyping still verifies once the starter takes over. Set it explicitly, and
-     * differently, whenever one key covers more than one log; never reuse an id across logs.
+     * key. Defaults to the table name, so a second audit table is a second chain without anyone
+     * configuring it, and the default table name equals {@link AuditChain#DEFAULT_CHAIN_ID} so a
+     * chain written with the plain constructor still verifies once the starter takes over. Never
+     * reuse an id across two logs.
      */
     private String chainId;
 
@@ -93,14 +94,14 @@ public class AuditChainProperties {
      * @return the identity to bind into this chain's hashes
      */
     public String resolveChainId() {
-        // Deliberately not the table name. Defaulting to it kept two tables apart for free, but it
-        // also meant the library had two different defaults, and the chain id is inside the hash: a
-        // chain written with the plain constructor reported HASH_MISMATCH on every record once the
-        // same application moved to the starter, with no migration path.
+        // The table name, so two audit tables under one key are two identities without anyone
+        // configuring it. Losing that default once let a tenant's history be replaced wholesale with
+        // another tenant's, verifying clean, because both resolved to the same id. The default table
+        // name is deliberately equal to AuditChain.DEFAULT_CHAIN_ID, so the plain constructor and
+        // the starter agree and a chain written while prototyping keeps verifying.
         //
-        // strip() is not applied either. This value exists to keep identities apart, so quietly
-        // folding "tenant-a" and " tenant-a " into one identity would defeat it; an id that differs
-        // only by whitespace is a different id, and one that is only whitespace is a mistake.
-        return chainId == null || chainId.isEmpty() ? AuditChain.DEFAULT_CHAIN_ID : chainId;
+        // No trimming: this value exists to keep identities apart, so folding two spellings into one
+        // would defeat it.
+        return chainId == null || chainId.isEmpty() ? tableName : chainId;
     }
 }
