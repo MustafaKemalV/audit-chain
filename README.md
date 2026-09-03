@@ -12,8 +12,10 @@ pinpoints exactly where it broke.
   `hash(n) = HMAC-SHA256(key, domainTag ‖ chainId ‖ canonicalBytes(record) ‖ previousHash)`, with
   every part length-prefixed so no combination can be re-split into a different one.
 - **`verify()` locates the break** and says why: content altered (`HASH_MISMATCH`), link rewritten
-  (`BROKEN_LINK`), record removed or reordered (`SEQUENCE_GAP`), records deleted from the end
-  (`TRUNCATED`), or a row that no longer decodes (`UNREADABLE_RECORD`).
+  or records reordered (`BROKEN_LINK`), record removed from the start or middle (`SEQUENCE_GAP`),
+  records deleted from the end (`TRUNCATED`), a row that no longer decodes (`UNREADABLE_RECORD`), or
+  a chain whose stored tip is gone (`CHAIN_HEAD_MISMATCH`). It never throws: any content the tables
+  can hold produces a verdict, because a scheduled check has to alert rather than crash.
 - **Appends do not race.** Writers from several application instances serialize on the chain's head
   row, so no audit record is lost to a concurrent write.
 - **Deterministic canonical encoding** (binary, length-prefixed, never JSON), so the same record
@@ -179,13 +181,15 @@ VerificationResult result = auditChain.verifyAgainstCheckpoint(anchor);
 | `audit-chain.enabled` | `true` | Turns the whole auto-configuration off |
 | `audit-chain.hmac-key` | none | Base64 HMAC key. Required; startup fails without it |
 | `audit-chain.table-name` | `audit_chain` | The append-only table |
-| `audit-chain.chain-id` | the table name | Bound into every hash, so records cannot be moved between chains sealed with the same key |
+| `audit-chain.chain-id` | `default` | Bound into every hash, so records cannot be moved between chains sealed with the same key |
 | `audit-chain.datasource-bean-name` | none | Which `DataSource` holds the audit table. Only needed when there is more than one |
-| `audit-chain.on-failure` | `FAIL` | What an `@Audited` method does when the audit write fails: `FAIL` takes the business call down with it, `LOG` records the problem and lets the call succeed unrecorded |
+| `audit-chain.on-failure` | `FAIL` | What an `@Audited` method does when the audit write fails. `FAIL` writes in the caller's transaction, so the record and the business data commit together and a failure takes the call down with it. `LOG` writes in a transaction of its own, so the call survives an audit failure and the record survives a business rollback: availability bought with atomicity |
 
-**On `chain-id`:** give each log its own whenever one key covers more than one of them. The default
-follows the table name, so two tables under one key are already kept apart. Reusing an id across two
-logs re-opens the hole it exists to close.
+**On `chain-id`:** give each log its own whenever one key covers more than one of them. There is a
+single default, `default`, shared by the starter and the plain constructor, so a chain written while
+prototyping keeps verifying once the starter takes over. The value is taken exactly as given and
+goes into every hash: reusing an id across two logs re-opens the hole it exists to close, and
+changing it makes the existing history unverifiable, with no migration path.
 
 ## How it works
 
@@ -204,20 +208,29 @@ Each of these is covered by a test, and the reason it reports is the one named h
 | Tampering | Reported as |
 | --- | --- |
 | A record's content was edited | `HASH_MISMATCH` |
-| A record was forged and appended | `HASH_MISMATCH` |
+| A record was forged and appended | `HASH_MISMATCH`, or `BROKEN_LINK` if its link is wrong too |
 | A record was removed from the start or the middle | `SEQUENCE_GAP` |
-| Records were reordered | `SEQUENCE_GAP` |
+| Records were reordered | `BROKEN_LINK`, or `HASH_MISMATCH` if their contents were swapped |
 | A link was rewritten to point elsewhere | `BROKEN_LINK` |
 | Records were deleted from the **end**, or the whole log was wiped | `TRUNCATED` |
 | Records from **another chain** were moved in, under the same key | `HASH_MISMATCH` |
 | A row's stored bytes will no longer decode | `UNREADABLE_RECORD` |
+| The stored tip is gone while records remain | `CHAIN_HEAD_MISMATCH` |
 
-The last three are worth spelling out, because a plain hash chain catches none of them.
+Reordering is worth a note, because the obvious guess is wrong. Swapping two sequence numbers does
+not produce a `SEQUENCE_GAP`: the store returns rows in sequence order, so the numbers still run
+0, 1, 2 and it is the links between them that no longer line up.
+
+The last four rows are worth spelling out, because a plain hash chain catches none of them.
 
 **Deleting from the end** leaves a shorter but perfectly valid chain, so the hash links cannot see
 it. It is caught by `audit_chain_head`, which remembers how many records the chain has ever held.
 **That protection is worth exactly as much as the grants on that table**: whoever can write there
 can lower the count and hide the deletion. See [Database privileges](#database-privileges).
+
+**Removing the tip row** does not disable that check: records with no tip at all is never a fresh
+chain, so it is reported rather than believed. What it cannot do is tell you what the tip used to
+say, so the chain's length is no longer provable from that point on.
 
 **Moving records between chains** is caught because `chain-id` is bound into every hash. Without it,
 a genuine and correctly signed history from one log verifies perfectly inside another log sealed
@@ -272,18 +285,27 @@ head row cannot delete the newest records without it showing.
 - **A chain is serial by nature.** A record cannot be sealed until the one before it is settled, so
   appends to one chain are processed one at a time. This is a property of hash chains, not an
   implementation shortcut. Throughput scales by running **several chains**, each with its own
-  `chain-id` and table, rather than by making one chain faster. Measured on PostgreSQL, splitting
-  one log into 8 chains cut wall-clock time for the same work by roughly 7x.
+  `chain-id` and table: appends serialize on a chain's own tip row, so separate chains do not wait
+  for each other. How much that buys you depends on your database and your transaction sizes, so
+  measure it on your own setup rather than trusting a number measured on someone else's.
 - **`verify()` reads the whole chain**, in pages rather than all at once, but it still walks every
   record from the start. It is O(n) in the length of the log, and there is no incremental
   verification from a trusted point yet.
 - **The chain starts at sequence 0** and is a single monotonic run. Log rotation and archival are
   not supported.
-- **`@Audited` writes inside the caller's transaction**, just before it commits, so a rolled-back
-  transaction leaves no record. This is deliberate: an audit entry saying an action happened when
-  the transaction rolled back is a lie, and a lie is worse than a gap. To record attempts that were
-  rolled back, call `append(...)` yourself from a `@Transactional(propagation = REQUIRES_NEW)`
-  method. `@Audited` also records no `details`; use `append(...)` for contextual key/values.
+- **`@Audited` writes inside the caller's transaction**, as the method returns, so a rolled-back
+  transaction leaves no record and work rolled back to a savepoint leaves none either. This is
+  deliberate: an audit entry saying an action happened when the transaction rolled back is a lie,
+  and a lie is worse than a gap. Whether the aspect runs inside the transaction is decided by advice
+  ordering and cannot be forced from the library, though in practice the transaction interceptor is
+  the outer one; if it matters to you, assert it, because an audit write that fails should take the
+  business call down with it.
+- **A read-only transaction still records.** It cannot carry the write, since the database refuses
+  both the row lock and the insert, so the record goes into a transaction of its own. It could not
+  share a read's fate in any case.
+- **To record attempts that were rolled back**, call `auditChain.appendIndependently(...)`, which
+  writes in its own transaction and so neither rolls back with the caller's work nor can fail it.
+  `@Audited` also records no `details`; use `append(...)` for contextual key/values.
 - **Only proxied calls are audited.** A call from inside the same bean, and `private`, `final` or
   `static` methods, are not recorded. This is the usual Spring proxying caveat.
 - **`@Audited` expressions need `-parameters`.** Without it `#id` resolves to `null` and every

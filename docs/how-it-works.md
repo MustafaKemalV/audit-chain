@@ -71,24 +71,40 @@ when this matters.
 ## 4. Verification
 
 `verify()` walks the chain from sequence 0 in pages, tracking the expected sequence number and
-previous hash. For each record it checks, in order:
+previous hash.
 
-1. `SEQUENCE_GAP`: the sequence number is not the one expected (a record was removed or reordered).
+A page is decoded as a whole before any record in it is checked, so a row that will not read back is
+found first, wherever it sits in that page, and reported as `UNREADABLE_RECORD`. The record is
+located by halving the page rather than reading it row by row, so one corrupt cell costs about ten
+queries instead of one per record.
+
+For each record that did decode, in order:
+
+1. `SEQUENCE_GAP`: the sequence number is not the one expected. Note that this means removed, not
+   reordered: the store returns rows in sequence order, so reordering surfaces as a broken link.
 2. `BROKEN_LINK`: `previousHash` does not equal the prior record's hash.
 3. `HASH_MISMATCH`: recomputing the hash does not match the stored one (the content was altered).
-4. `UNREADABLE_RECORD`: the stored bytes will not decode, or the row claims a format version this
-   build cannot write.
 
-After the walk it compares how many records it saw against the chain's remembered length, reporting
-`TRUNCATED` if records are missing from the end. This check exists because the hash links cannot
-reveal that particular deletion: what is left after it is a shorter but perfectly valid chain.
+After the walk it compares what it saw against the stored tip, which is the only thing that
+remembers how long the chain has been. Fewer records than the tip remembers is `TRUNCATED`; records
+with no tip at all is `CHAIN_HEAD_MISMATCH`. Both checks exist because the hash links cannot reveal
+a deletion from the end: what is left after one is a shorter but perfectly valid chain.
+
+The tip is read before the walk, deliberately. An append landing while verification pages through
+the log can only make the chain longer than the tip already read, never shorter, so a chain that is
+merely growing cannot trip either check.
 
 It returns the **first** broken sequence and the reason, or `intact()`. Comparisons use a
 constant-time check.
 
-Verification is **total**: for any content the table happens to hold, it returns a result rather than
-throwing. A monitoring job asking "is the log intact" has to get an answer even when the answer is
-produced by bytes nobody expected, otherwise tampering shows up as a crash instead of an alert.
+Verification is **total**: for any content the tables happen to hold, it returns a result rather
+than throwing. A monitoring job asking "is the log intact" has to get an answer even when the answer
+is produced by bytes nobody expected, otherwise tampering shows up as a crash instead of an alert.
+
+This is a contract on the store, not a wide catch inside verification: the SPI requires a row that
+will not read back to surface as `MalformedRecordException`, and the JDBC store translates every way
+its columns can fail that test, including values a database will happily accept such as a zero
+format version or a negative remembered count.
 
 An attacker without the key cannot repair the chain: altering a record changes its hash (avalanche
 effect), and they cannot compute the correct replacement hash without the key.
@@ -102,18 +118,24 @@ sealed until the one before it is settled. Two writers that read the same tip co
 sequence number, and one of them loses its record. Taking a row lock while reading the tip turns
 that collision into an orderly queue.
 
-Two things had to be true for that lock to mean anything, and both were learned the hard way. The
+Three things had to be true for that lock to mean anything, and each was learned the hard way. The
 lock has to be held across the whole read-then-write step, which is why sealing a record is handed
 to the store as one unit of work: outside a transaction the lock is released the moment the read
-finishes, and the protection quietly disappears. And there has to be a row to lock, which is why the
-schema seeds it.
+finishes and the protection quietly disappears. It has to be taken in the application's own
+transaction, not one the store invents, or the audit record commits separately and outlives a
+rolled-back business operation. And there has to be a row to lock: the store creates the tip row
+itself, in a transaction of its own, because two writers inside their own uncommitted appends cannot
+see each other's insert and both would try.
 
 **It remembers the chain's length.** `record_count` only ever grows, and verification compares it
 against the records actually present. That is what makes deleting the newest rows visible.
 
 The cost is that this table needs `UPDATE`, unlike the audit table, so it has to be granted
-separately. Whoever can write to it can stall appends and can hide a truncation, but cannot forge a
-record: the hashes still have to line up.
+separately. Whoever can write to it can hide a truncation by lowering the remembered count, and can
+stop the chain entirely by setting the tip behind the records, after which every append collides
+forever. What they cannot do is forge a record, because the hashes still have to line up, and they
+cannot choose what an anchoring job exports: a checkpoint is read from a real record, not from this
+row.
 
 A rolled-back transaction leaves no gap. The sequence is derived from committed state on every
 append and never from a counter, so a number claimed by a transaction that then rolled back is

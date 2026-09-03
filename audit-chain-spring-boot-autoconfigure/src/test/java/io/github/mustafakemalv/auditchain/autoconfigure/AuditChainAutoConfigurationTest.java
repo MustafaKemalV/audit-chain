@@ -83,12 +83,32 @@ class AuditChainAutoConfigurationTest {
     }
 
     @Test
-    void chainIdDefaultsToTheTableName() {
-        // Two logs under one key are kept apart with no configuration at all, because a separate
-        // table already means a separate chain.
+    void chainIdDefaultsToTheSameValueThePlainConstructorUses() {
+        // One default, not two. The chain id is inside the hash, so a chain written with the plain
+        // constructor while prototyping has to keep verifying once the starter takes over.
         runner.withPropertyValues("audit-chain.hmac-key=" + KEY_B64, "audit-chain.table-name=payments_audit")
                 .run(context -> assertThat(context.getBean(AuditChain.class).chainId())
-                        .isEqualTo("payments_audit"));
+                        .isEqualTo(AuditChain.DEFAULT_CHAIN_ID));
+    }
+
+    @Test
+    void aChainIdIsTakenExactlyAsGiven() {
+        // The library does no trimming of its own: this value exists to keep identities apart, so
+        // folding two spellings into one would defeat it. Note that Spring's own property binding
+        // trims what it reads from configuration, which is outside this library's control; the
+        // guarantee here is that nothing is folded after that point.
+        AuditChainProperties properties = new AuditChainProperties();
+        properties.setChainId(" eu-tenant-7 ");
+
+        assertThat(properties.resolveChainId()).isEqualTo(" eu-tenant-7 ");
+    }
+
+    @Test
+    void aBlankChainIdFallsBackToTheDefault() {
+        AuditChainProperties properties = new AuditChainProperties();
+        properties.setChainId("");
+
+        assertThat(properties.resolveChainId()).isEqualTo(AuditChain.DEFAULT_CHAIN_ID);
     }
 
     @Test
@@ -99,7 +119,7 @@ class AuditChainAutoConfigurationTest {
     }
 
     @Test
-    void anExplicitChainIdWinsOverTheTableName() {
+    void anExplicitChainIdWinsOverTheDefault() {
         runner.withPropertyValues("audit-chain.hmac-key=" + KEY_B64,
                         "audit-chain.table-name=payments_audit",
                         "audit-chain.chain-id=eu-tenant-7")
