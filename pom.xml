@@ -18,7 +18,7 @@
 
     <name>audit-chain-parent</name>
     <description>Tamper-evident, HMAC-SHA256 hash-chained, append-only audit log for Spring Boot.</description>
-    <url>https://github.com/MustafaKemalV/audit-chain</url>
+    <url child.project.url.inherit.append.path="false">https://github.com/MustafaKemalV/audit-chain</url>
 
     <licenses>
         <license>
@@ -26,6 +26,32 @@
             <url>https://opensource.org/licenses/MIT</url>
         </license>
     </licenses>
+
+    <!--
+        Declared explicitly because spring-boot-starter-parent declares its own. Without these,
+        every artifact here would be published to Maven Central crediting Spring / VMware as the
+        developer, with an SCM URL pointing at spring-projects/spring-boot. Central's validation
+        would not object, since the fields are present, and a published version cannot be corrected.
+
+        The child.scm.*.inherit.append.path attributes stop Maven appending each module's artifactId
+        to the inherited URLs.
+    -->
+    <developers>
+        <developer>
+            <id>MustafaKemalV</id>
+            <name>Mustafa Kemal Vural</name>
+            <url>https://github.com/MustafaKemalV</url>
+        </developer>
+    </developers>
+
+    <scm child.scm.connection.inherit.append.path="false"
+         child.scm.developerConnection.inherit.append.path="false"
+         child.scm.url.inherit.append.path="false">
+        <connection>scm:git:https://github.com/MustafaKemalV/audit-chain.git</connection>
+        <developerConnection>scm:git:ssh://git@github.com/MustafaKemalV/audit-chain.git</developerConnection>
+        <url>https://github.com/MustafaKemalV/audit-chain</url>
+        <tag>HEAD</tag>
+    </scm>
 
     <modules>
         <module>audit-chain-core</module>
@@ -42,6 +68,8 @@
             name fails at startup with nothing pointing at the cause.
         -->
         <maven.compiler.proc>full</maven.compiler.proc>
+        <!-- Fixed timestamps make the jars byte-reproducible; bump on each release. -->
+        <project.build.outputTimestamp>2026-09-03T00:00:00Z</project.build.outputTimestamp>
     </properties>
 
     <build>
@@ -70,6 +98,84 @@
     </build>
 
     <profiles>
+        <!--
+            Signing and publishing, kept out of the everyday build so `mvn install` stays fast and
+            needs no GPG key. Activate with -Prelease.
+        -->
+        <profile>
+            <id>release</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.sonatype.central</groupId>
+                        <artifactId>central-publishing-maven-plugin</artifactId>
+                        <version>0.11.0</version>
+                        <extensions>true</extensions>
+                        <configuration>
+                            <publishingServerId>central</publishingServerId>
+                            <!--
+                                Upload and validate, then wait for a human to press Publish in the
+                                Portal. Publishing is irreversible, so the first release should be
+                                looked at before it becomes permanent.
+                            -->
+                            <autoPublish>false</autoPublish>
+                            <waitUntil>validated</waitUntil>
+                        </configuration>
+                    </plugin>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-source-plugin</artifactId>
+                        <!-- version managed by spring-boot-dependencies -->
+                        <executions>
+                            <execution>
+                                <id>attach-sources</id>
+                                <goals>
+                                    <goal>jar-no-fork</goal>
+                                </goals>
+                            </execution>
+                        </executions>
+                    </plugin>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-javadoc-plugin</artifactId>
+                        <!-- version managed by spring-boot-dependencies -->
+                        <configuration>
+                            <doclint>none</doclint>
+                        </configuration>
+                        <executions>
+                            <execution>
+                                <id>attach-javadocs</id>
+                                <goals>
+                                    <goal>jar</goal>
+                                </goals>
+                            </execution>
+                        </executions>
+                    </plugin>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-gpg-plugin</artifactId>
+                        <!-- Pinned: Spring's parent manages the two plugins above, but not this one. -->
+                        <version>3.2.8</version>
+                        <executions>
+                            <execution>
+                                <id>sign-artifacts</id>
+                                <phase>verify</phase>
+                                <goals>
+                                    <goal>sign</goal>
+                                </goals>
+                                <configuration>
+                                    <gpgArguments>
+                                        <arg>--pinentry-mode</arg>
+                                        <arg>loopback</arg>
+                                    </gpgArguments>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+
         <!--
             Mutation testing, run on demand with -Pmutation. In a library whose whole claim is that
             tampering is detectable, "which production line can I delete with the tests still green"
