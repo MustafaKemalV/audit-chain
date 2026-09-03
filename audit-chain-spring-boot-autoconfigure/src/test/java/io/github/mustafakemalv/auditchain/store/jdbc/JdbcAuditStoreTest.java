@@ -28,6 +28,9 @@ import java.util.concurrent.TimeoutException;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import javax.sql.DataSource;
+import org.springframework.jdbc.core.PreparedStatementCreator;
+import org.springframework.jdbc.core.RowMapper;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.embedded.EmbeddedDatabase;
 import org.springframework.jdbc.datasource.embedded.EmbeddedDatabaseBuilder;
@@ -446,5 +449,106 @@ class JdbcAuditStoreTest {
         assertThat(stored).as("no append may be lost on a freshly created chain").isEqualTo(total);
         assertThat(jdbcTemplate.queryForObject("SELECT COUNT(*) FROM my_audit", Long.class))
                 .isEqualTo(total);
+    }
+
+    @Test
+    void verifyReturnsAVerdictForAnyContentTheTablesCanHold() {
+        // The docs call verification total: for any bytes the tables happen to hold it returns a
+        // result rather than throwing. A monitoring job that calls verify() on a schedule has to get
+        // an answer even when the answer is produced by content nobody expected, otherwise tampering
+        // surfaces as a crash instead of an alert. Every value below is legal for its column type,
+        // and two of them are writable with exactly the privileges the README recommends granting.
+        record Corruption(String description, String sql) { }
+        List<Corruption> corruptions = List.of(
+                new Corruption("details is not base64",
+                        "UPDATE audit_chain SET details = 'not-base64!!!' WHERE sequence = 1"),
+                new Corruption("details decodes to a map with a null key",
+                        "UPDATE audit_chain SET details = 'AAAAAf////8AAAAA' WHERE sequence = 1"),
+                new Corruption("format_version is zero",
+                        "UPDATE audit_chain SET format_version = 0 WHERE sequence = 1"),
+                new Corruption("format_version is negative",
+                        "UPDATE audit_chain SET format_version = -3 WHERE sequence = 1"),
+                new Corruption("previous_hash is not a hash",
+                        "UPDATE audit_chain SET previous_hash = 'zzz' WHERE sequence = 1"),
+                new Corruption("the tip remembers a negative count",
+                        "UPDATE audit_chain_head SET record_count = -1"),
+                new Corruption("the tip's sequence is below the genesis",
+                        "UPDATE audit_chain_head SET last_sequence = -2"),
+                new Corruption("the tip's hash is not a hash",
+                        "UPDATE audit_chain_head SET last_hash = 'zzz'"));
+
+        for (Corruption corruption : corruptions) {
+            resetChainWithThreeRecords();
+            jdbcTemplate.update(corruption.sql());
+
+            VerificationResult result = catchVerdict();
+
+            assertThat(result)
+                    .as("verify() threw instead of reporting: %s", corruption.description())
+                    .isNotNull();
+            assertThat(result.valid())
+                    .as("corrupted content must not verify: %s", corruption.description())
+                    .isFalse();
+        }
+    }
+
+    /** Runs verify() and returns null if it threw, so the assertion can name what broke. */
+    private VerificationResult catchVerdict() {
+        try {
+            return newChain().verify();
+        } catch (RuntimeException e) {
+            return null;
+        }
+    }
+
+    private void resetChainWithThreeRecords() {
+        jdbcTemplate.update("DELETE FROM audit_chain");
+        jdbcTemplate.update("DELETE FROM audit_chain_head");
+        AuditChain chain = newChain();
+        for (int i = 0; i < 3; i++) {
+            chain.append(AuditEvent.of("alice", "act." + i));
+        }
+    }
+
+    @Test
+    void anUnreadableRecordIsFoundWithoutScanningEveryRow() {
+        // Locating the bad record used to cost a query per record, so corrupting one cell near the
+        // end of a page amplified every future verification a thousandfold. It also has to name the
+        // right record, which is what makes the result actionable.
+        AuditChain chain = newChain();
+        for (int i = 0; i < 300; i++) {
+            chain.append(AuditEvent.of("alice", "act." + i));
+        }
+        jdbcTemplate.update("UPDATE audit_chain SET details = 'not-base64!!!' WHERE sequence = 250");
+
+        CountingJdbcTemplate counting = new CountingJdbcTemplate(database);
+        AuditChain counted = new AuditChain(KEY,
+                new JdbcAuditStore(counting, "audit_chain", JdbcAuditStore.DEFAULT_HEAD_TABLE,
+                        new DataSourceTransactionManager(database)),
+                "audit_chain");
+
+        VerificationResult result = counted.verify();
+
+        assertThat(result.reason()).isEqualTo(FailureReason.UNREADABLE_RECORD);
+        assertThat(result.brokenSequence()).isEqualTo(250L);
+        assertThat(counting.queries)
+                .as("narrowing by halving, not one query per record")
+                .isLessThan(30);
+    }
+
+    /** Counts the queries a verification costs, so amplification is measured rather than assumed. */
+    static class CountingJdbcTemplate extends JdbcTemplate {
+
+        int queries;
+
+        CountingJdbcTemplate(DataSource dataSource) {
+            super(dataSource);
+        }
+
+        @Override
+        public <T> List<T> query(PreparedStatementCreator psc, RowMapper<T> rowMapper) {
+            queries++;
+            return super.query(psc, rowMapper);
+        }
     }
 }

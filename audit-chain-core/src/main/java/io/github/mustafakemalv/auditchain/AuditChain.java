@@ -175,7 +175,15 @@ public final class AuditChain {
      * @return where the chain first breaks, or an intact result
      */
     public VerificationResult verify() {
-        ChainHead head = store.head();
+        ChainHead head;
+        try {
+            head = store.head();
+        } catch (MalformedRecordException e) {
+            // The stored tip itself will not read back. That is the same class of evidence as a
+            // corrupt record, and reporting it beats throwing at a caller who asked a yes-or-no
+            // question about the log's integrity.
+            return VerificationResult.broken(0L, FailureReason.CHAIN_HEAD_MISMATCH);
+        }
         String expectedPreviousHash = GENESIS_PREVIOUS_HASH;
         long expectedSequence = 0L;
         long seen = 0L;
@@ -242,20 +250,29 @@ public final class AuditChain {
 
     /** Walks one page a record at a time to name the sequence whose stored bytes will not decode. */
     private VerificationResult locateUnreadableRecord(long fromSequence) {
-        long sequence = fromSequence;
-        for (int scanned = 0; scanned < VERIFY_PAGE_SIZE; scanned++) {
-            List<ChainedRecord> single;
+        // Narrow the page by halving it rather than stepping through it. Reading one record at a
+        // time cost a query per record, so corrupting a single cell near the end of a page bought a
+        // thousandfold amplification of every scheduled verification: cheap for the attacker,
+        // expensive forever after. Halving makes it about ten queries.
+        long start = fromSequence;
+        int span = VERIFY_PAGE_SIZE;
+        while (span > 1) {
+            int half = span / 2;
+            List<ChainedRecord> firstHalf;
             try {
-                single = store.findRange(sequence, 1);
+                firstHalf = store.findRange(start, half);
             } catch (MalformedRecordException e) {
-                return VerificationResult.broken(sequence, FailureReason.UNREADABLE_RECORD);
+                span = half;          // the bad record is in the half we just tried
+                continue;
             }
-            if (single.isEmpty()) {
+            if (firstHalf.size() < half) {
+                // The first half held every record there is, so nothing further to narrow into.
                 break;
             }
-            sequence = single.get(0).record().sequence() + 1;
+            start = firstHalf.get(firstHalf.size() - 1).record().sequence() + 1;
+            span -= half;             // it must be in the half we have not tried
         }
-        return VerificationResult.broken(fromSequence, FailureReason.UNREADABLE_RECORD);
+        return VerificationResult.broken(start, FailureReason.UNREADABLE_RECORD);
     }
 
     /**
@@ -294,12 +311,22 @@ public final class AuditChain {
         // A checkpoint pins one point, so on its own it says nothing about what came after it. A
         // chain that no longer reaches the anchored sequence has lost everything above it, which is
         // exactly the deletion an anchor is supposed to make visible.
-        ChainHead head = store.head();
+        ChainHead head;
+        try {
+            head = store.head();
+        } catch (MalformedRecordException e) {
+            return VerificationResult.broken(0L, FailureReason.CHAIN_HEAD_MISMATCH);
+        }
         if (head.lastSequence() < checkpoint.sequence()) {
             return VerificationResult.broken(checkpoint.sequence(), FailureReason.TRUNCATED);
         }
 
-        List<ChainedRecord> anchored = store.findRange(checkpoint.sequence(), 1);
+        List<ChainedRecord> anchored;
+        try {
+            anchored = store.findRange(checkpoint.sequence(), 1);
+        } catch (MalformedRecordException e) {
+            return VerificationResult.broken(checkpoint.sequence(), FailureReason.UNREADABLE_RECORD);
+        }
         if (anchored.isEmpty() || anchored.get(0).record().sequence() != checkpoint.sequence()) {
             return VerificationResult.broken(checkpoint.sequence(), FailureReason.CHECKPOINT_MISMATCH);
         }

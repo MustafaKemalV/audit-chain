@@ -6,6 +6,7 @@ import io.github.mustafakemalv.auditchain.core.ChainedRecord;
 import io.github.mustafakemalv.auditchain.store.AuditStore;
 import io.github.mustafakemalv.auditchain.store.AuditStoreException;
 import io.github.mustafakemalv.auditchain.store.DetailsCodec;
+import io.github.mustafakemalv.auditchain.store.MalformedRecordException;
 import java.sql.PreparedStatement;
 import java.time.Instant;
 import java.util.List;
@@ -52,19 +53,29 @@ public class JdbcAuditStore implements AuditStore {
     private static final int MAX_STRING_LENGTH = 255;
 
     private static final RowMapper<ChainedRecord> ROW_MAPPER = (rs, rowNum) -> {
-        AuditRecord record = new AuditRecord(
-                rs.getLong("sequence"),
-                Instant.ofEpochMilli(rs.getLong("timestamp_ms")),
-                rs.getString("actor"),
-                rs.getString("action"),
-                rs.getString("resource_type"),
-                rs.getString("resource_id"),
-                DetailsCodec.decode(rs.getString("details")));
-        return new ChainedRecord(
-                record,
-                rs.getString("previous_hash"),
-                rs.getString("hash"),
-                rs.getInt("format_version"));
+        // Every column here is one an attacker or a botched migration can set to something the
+        // domain types reject, and each of those rejections is an IllegalArgumentException. The SPI
+        // promises callers that a row which will not read back surfaces as MalformedRecordException,
+        // so translating it is the store's job: without this, one UPDATE turns "the chain is broken
+        // here" into a stack trace escaping a scheduled verification.
+        try {
+            AuditRecord record = new AuditRecord(
+                    rs.getLong("sequence"),
+                    Instant.ofEpochMilli(rs.getLong("timestamp_ms")),
+                    rs.getString("actor"),
+                    rs.getString("action"),
+                    rs.getString("resource_type"),
+                    rs.getString("resource_id"),
+                    DetailsCodec.decode(rs.getString("details")));
+            return new ChainedRecord(
+                    record,
+                    rs.getString("previous_hash"),
+                    rs.getString("hash"),
+                    rs.getInt("format_version"));
+        } catch (IllegalArgumentException e) {
+            throw new MalformedRecordException(
+                    "audit row " + rs.getLong("sequence") + " does not read back as a record", e);
+        }
     };
 
     private final JdbcTemplate jdbcTemplate;
@@ -292,6 +303,21 @@ public class JdbcAuditStore implements AuditStore {
                 tableName, -1L, ChainHead.GENESIS_HASH, 0L, System.currentTimeMillis(), tableName);
     }
 
+    /** Same translation as the row mapper: the tip row is stored data and can be corrupt too. */
+    private ChainHead toChainHead(Map<String, Object> row) {
+        try {
+            return new ChainHead(
+                    ((Number) row.get("last_sequence")).longValue(),
+                    // CHAR(64) is blank-padded on some databases, so trim before it reaches a hash
+                    // comparison.
+                    ((String) row.get("last_hash")).trim(),
+                    ((Number) row.get("record_count")).longValue());
+        } catch (IllegalArgumentException | ClassCastException | NullPointerException e) {
+            throw new MalformedRecordException(
+                    "the " + headTableName + " row for " + tableName + " does not read back as a tip", e);
+        }
+    }
+
     @Override
     public ChainHead head() {
         return readHead(false);
@@ -302,12 +328,8 @@ public class JdbcAuditStore implements AuditStore {
                 + " WHERE chain_table = ?" + (forUpdate ? " FOR UPDATE" : "");
         try {
             Map<String, Object> row = jdbcTemplate.queryForMap(sql, tableName);
-            return new ChainHead(
-                    ((Number) row.get("last_sequence")).longValue(),
-                    // CHAR(64) is blank-padded on some databases, so trim before it reaches a hash
-                    // comparison.
-                    ((String) row.get("last_hash")).trim(),
-                    ((Number) row.get("record_count")).longValue());
+            return toChainHead(
+                    row);
         } catch (EmptyResultDataAccessException e) {
             // No tip row yet: this chain has never been appended to.
             return ChainHead.empty();
