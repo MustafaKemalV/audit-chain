@@ -33,6 +33,12 @@ public class AuditChainProperties {
     private String datasourceBeanName;
 
     /**
+     * Which PlatformTransactionManager bean governs the audit table. Only needed when the
+     * application defines more than one; with a single manager it is picked up automatically.
+     */
+    private String transactionManagerBeanName;
+
+    /**
      * What an {@code @Audited} method does when the audit write itself fails: FAIL lets the failure
      * reach the caller and take the business operation with it, LOG records the problem and lets the
      * operation succeed unrecorded. FAIL is the default because an audit log with silent holes is
@@ -70,6 +76,14 @@ public class AuditChainProperties {
 
     public void setOnFailure(AuditFailureMode onFailure) {
         this.onFailure = onFailure;
+    }
+
+    public String getTransactionManagerBeanName() {
+        return transactionManagerBeanName;
+    }
+
+    public void setTransactionManagerBeanName(String transactionManagerBeanName) {
+        this.transactionManagerBeanName = transactionManagerBeanName;
     }
 
     public String getDatasourceBeanName() {

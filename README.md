@@ -181,15 +181,16 @@ VerificationResult result = auditChain.verifyAgainstCheckpoint(anchor);
 | `audit-chain.enabled` | `true` | Turns the whole auto-configuration off |
 | `audit-chain.hmac-key` | none | Base64 HMAC key. Required; startup fails without it |
 | `audit-chain.table-name` | `audit_chain` | The append-only table |
-| `audit-chain.chain-id` | `default` | Bound into every hash, so records cannot be moved between chains sealed with the same key |
+| `audit-chain.chain-id` | the table name | Bound into every hash, so records cannot be moved between chains sealed with the same key |
+| `audit-chain.transaction-manager-bean-name` | none | Which transaction manager governs the audit table. Only needed when there is more than one |
 | `audit-chain.datasource-bean-name` | none | Which `DataSource` holds the audit table. Only needed when there is more than one |
 | `audit-chain.on-failure` | `FAIL` | What an `@Audited` method does when the audit write fails. `FAIL` writes in the caller's transaction, so the record and the business data commit together and a failure takes the call down with it. `LOG` writes in a transaction of its own, so the call survives an audit failure and the record survives a business rollback: availability bought with atomicity |
 
-**On `chain-id`:** give each log its own whenever one key covers more than one of them. There is a
-single default, `default`, shared by the starter and the plain constructor, so a chain written while
-prototyping keeps verifying once the starter takes over. The value is taken exactly as given and
-goes into every hash: reusing an id across two logs re-opens the hole it exists to close, and
-changing it makes the existing history unverifiable, with no migration path.
+**On `chain-id`:** it defaults to the table name, so a second audit table is a second chain with
+nothing to configure, and the default table name equals the plain constructor's default so a chain
+written while prototyping keeps verifying once the starter takes over. The value is taken exactly as
+given and goes into every hash: reusing an id across two logs re-opens the hole it exists to close,
+and changing it makes the existing history unverifiable, with no migration path.
 
 ## How it works
 
@@ -280,6 +281,22 @@ Someone who can write to the head row can stall appends and can hide a truncatio
 a record: the hashes still have to line up. Someone who can write to `audit_chain` but not to the
 head row cannot delete the newest records without it showing.
 
+## Operational requirements
+
+Two things the library needs from its surroundings, neither of which it can check for you at
+startup:
+
+- **A transaction manager that governs the audit table's `DataSource`.** With one of each, this is
+  automatic. With several, name them: `audit-chain.datasource-bean-name` and
+  `audit-chain.transaction-manager-bean-name`. A mismatched pair is refused where it can be proven
+  wrong, because the alternative is silent: the row lock guarding appends would be taken and
+  released in autocommit, and measured in that shape, 81 of 100 concurrent appends were rejected.
+- **Room for a second connection per request** when `audit-chain.on-failure=LOG` is set, or when
+  auditing read-only transactions. Both write in a transaction of their own, so they hold a second
+  pooled connection while the caller still holds its own. With a pool exactly as large as the number
+  of concurrent requests, that deadlocks. Size the pool for two connections per audited request, or
+  keep the default `FAIL` mode and audit only read-write work.
+
 ## Limitations
 
 - **A chain is serial by nature.** A record cannot be sealed until the one before it is settled, so
@@ -315,6 +332,19 @@ head row cannot delete the newest records without it showing.
   `actor`, `action`, `resourceType` and `resourceId` must fit 255. Oversized values are rejected
   rather than left to a database that would silently truncate them, because a truncated value no
   longer re-hashes to its stored hash and would report as tampering forever.
+- **An attacker with `INSERT` on the audit table can stop the log.** One row occupying the next
+  sequence makes every later append collide with the primary key, and the table is append-only, so
+  the row cannot be removed without a privilege the deployment deliberately withholds. This is an
+  availability attack rather than a tampering one: the records already written stay verifiable, and
+  the forged row itself is reported. Grant `INSERT` only to the application.
+- **Deleting the tip row stops appends until it is repaired.** It is reported
+  (`CHAIN_HEAD_MISMATCH`) rather than believed, but the chain cannot resume on its own: the
+  recreated row starts at sequence 0 and collides with the existing records. Restore both tables
+  together, or set the tip past the table's highest sequence by hand.
+- **A read-only flag is inherited by nested transactions.** A read-write method participating in a
+  read-only transaction is still treated as read-only, so its audit record is written independently
+  and survives an outer rollback. Narrow in practice, since the database refuses the business write
+  in that arrangement too.
 - **Empty strings on Oracle.** A database that treats `''` as `NULL` will round-trip an empty field
   as `null` and fail verification. Use a database that distinguishes them, or avoid empty-string
   fields.

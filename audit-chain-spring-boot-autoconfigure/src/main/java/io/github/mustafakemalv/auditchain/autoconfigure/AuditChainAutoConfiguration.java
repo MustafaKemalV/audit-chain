@@ -48,18 +48,37 @@ public class AuditChainAutoConfiguration {
             // constructing our own would silently open a second transaction under JTA, JPA without a
             // DataSource, or a proxy-wrapped one, and the audit record would then outlive a rolled
             // back business operation.
-            PlatformTransactionManager transactionManager = transactionManagers.getIfUnique();
-            if (transactionManager == null && transactionManagers.stream().findAny().isPresent()) {
-                log.warn("audit-chain: several PlatformTransactionManager beans are defined and none "
-                        + "is marked @Primary, so audit writes will manage their own transactions and "
-                        + "may not share the fate of the business operation they record.");
-            }
+            PlatformTransactionManager transactionManager =
+                    resolveTransactionManager(properties, transactionManagers, beanFactory);
             return new JdbcAuditStore(new JdbcTemplate(resolved), properties.getTableName(),
                     JdbcAuditStore.DEFAULT_HEAD_TABLE, transactionManager);
         }
         log.warn("audit-chain: no DataSource found, falling back to an in-memory store. Records will "
                 + "NOT survive a restart; configure a DataSource for durable auditing.");
         return new InMemoryAuditStore();
+    }
+
+    private static PlatformTransactionManager resolveTransactionManager(AuditChainProperties properties,
+            ObjectProvider<PlatformTransactionManager> transactionManagers, BeanFactory beanFactory) {
+        String configured = properties.getTransactionManagerBeanName();
+        if (configured != null && !configured.isBlank()) {
+            return beanFactory.getBean(configured.strip(), PlatformTransactionManager.class);
+        }
+        PlatformTransactionManager unique = transactionManagers.getIfUnique();
+        if (unique != null) {
+            return unique;
+        }
+        if (transactionManagers.stream().findAny().isPresent()) {
+            // Carrying on with a manager of our own looks harmless and is not: it starts a second
+            // transaction on a second connection, so the row lock guarding appends is taken and
+            // released in autocommit and the audit record stops sharing the caller's fate. Measured
+            // in that shape, 81 of 100 concurrent appends were rejected, and under JPA the audit
+            // library committed the application's own uncommitted work.
+            throw new IllegalStateException("audit-chain: several PlatformTransactionManager beans are "
+                    + "defined and none is marked @Primary, so it is not clear which one governs the "
+                    + "audit table. Set audit-chain.transaction-manager-bean-name to choose one.");
+        }
+        return null;
     }
 
     private static DataSource resolveDataSource(AuditChainProperties properties,

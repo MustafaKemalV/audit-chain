@@ -44,9 +44,9 @@ public record ChainedRecord(AuditRecord record, String previousHash, String hash
      * @param record what happened
      * @param previousHash the hash of the preceding node
      * @param hash this node's own hash
-     * @return a node carrying {@link CanonicalEncoder#CURRENT_FORMAT_VERSION}
+     * @return a node carrying {@link CanonicalEncoder#currentFormatVersion()}
      */
     public static ChainedRecord currentFormat(AuditRecord record, String previousHash, String hash) {
-        return new ChainedRecord(record, previousHash, hash, CanonicalEncoder.CURRENT_FORMAT_VERSION);
+        return new ChainedRecord(record, previousHash, hash, CanonicalEncoder.currentFormatVersion());
     }
 }

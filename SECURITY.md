@@ -37,6 +37,11 @@ Out of scope, because these are the library's stated limits rather than defects:
   this protection is worth, which the README states.
 - Anything above the last anchored checkpoint, for a key holder.
 - An action that never reached the library at all.
+- An attacker with `INSERT` on the audit table stopping future appends by occupying the next
+  sequence. The records already written stay verifiable and the forged row is reported; this costs
+  availability, not evidence.
+- Connection-pool exhaustion when `on-failure=LOG` or read-only auditing is used without sizing the
+  pool for two connections per audited request. See Operational requirements in the README.
 
 See the threat model in [README.md](README.md) for the full picture.
 

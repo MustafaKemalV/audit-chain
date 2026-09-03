@@ -19,6 +19,7 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.EnableAspectJAutoProxy;
 import io.github.mustafakemalv.auditchain.store.jdbc.JdbcAuditStore;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.DataSourceTransactionManager;
 import org.springframework.jdbc.datasource.embedded.EmbeddedDatabaseBuilder;
@@ -142,7 +143,7 @@ class AuditedAspectTest {
     }
 
     @Test
-    void onFailureLogLetsTheBusinessCallSucceedUnrecorded() {
+    void onFailureLogSwallowsTheFailureWithNoTransactionInPlay() {
         runner.withUserConfiguration(BrokenStoreConfig.class)
                 .withPropertyValues("audit-chain.on-failure=log")
                 .run(context -> {
@@ -276,17 +277,71 @@ class AuditedAspectTest {
 
     @Test
     void logModeKeepsTheBusinessWorkWhenTheAuditWriteFails() {
-        // Swallowing the exception is not enough on its own: a failure inside the caller's
-        // transaction marks it rollback-only, so the business work would be lost anyway and the log
-        // line claiming the action succeeded would be false.
-        runner.withUserConfiguration(BrokenStoreConfig.class)
+        // This has to run in a real transaction against a real database, with a store that fails at
+        // the database rather than before reaching it. An earlier version of this test used a
+        // context with no transaction manager and an in-memory store that threw immediately, so it
+        // passed even with the fix reverted: the mechanism it claims to prove was never set up.
+        //
+        // What must hold: the audit write fails, the caller's transaction still commits, and the
+        // business row is really in the database afterwards.
+        transactionalRunner().withUserConfiguration(FailingSqlStoreConfig.class)
                 .withPropertyValues("audit-chain.on-failure=log")
                 .run(context -> {
-                    CountingService service = context.getBean(CountingService.class);
-                    service.doWork();
+                    BusinessService service = context.getBean(BusinessService.class);
 
-                    assertThat(service.isCompleted()).as("the business call ran to completion").isTrue();
+                    service.doWorkAndRecord();
+
+                    assertThat(context.getBean(JdbcTemplate.class)
+                            .queryForObject("SELECT COUNT(*) FROM business", Long.class))
+                            .as("the business row survived an audit failure")
+                            .isEqualTo(1L);
                 });
+    }
+
+    @Test
+    void failModeTakesTheBusinessWorkDownWithTheAuditFailure() {
+        // The other half of the same choice, and the reason LOG has to be asked for explicitly.
+        transactionalRunner().withUserConfiguration(FailingSqlStoreConfig.class)
+                .run(context -> {
+                    BusinessService service = context.getBean(BusinessService.class);
+
+                    assertThatThrownBy(service::doWorkAndRecord).isInstanceOf(RuntimeException.class);
+
+                    assertThat(context.getBean(JdbcTemplate.class)
+                            .queryForObject("SELECT COUNT(*) FROM business", Long.class))
+                            .as("the business row went back with the failed audit")
+                            .isZero();
+                });
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    static class FailingSqlStoreConfig {
+
+        @Bean
+        BusinessService businessService() {
+            return new BusinessService();
+        }
+
+        @Bean
+        AuditStore auditStore(JdbcTemplate jdbcTemplate, PlatformTransactionManager transactionManager) {
+            jdbcTemplate.execute("CREATE TABLE IF NOT EXISTS business (id INT PRIMARY KEY)");
+            // Points at a table that does not exist, so the write fails inside the database and
+            // takes the caller's connection with it, which is what a real outage does.
+            return new JdbcAuditStore(jdbcTemplate, "no_such_audit_table",
+                    JdbcAuditStore.DEFAULT_HEAD_TABLE, transactionManager);
+        }
+    }
+
+    static class BusinessService {
+
+        @Autowired
+        private JdbcTemplate jdbcTemplate;
+
+        @Transactional
+        @Audited(action = "business.op")
+        public void doWorkAndRecord() {
+            jdbcTemplate.update("INSERT INTO business(id) VALUES (1)");
+        }
     }
 
     @Configuration(proxyBeanMethods = false)

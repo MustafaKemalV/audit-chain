@@ -46,9 +46,19 @@ public record ChainHead(long lastSequence, String lastHash, long recordCount) {
         if (recordCount < 0) {
             throw new IllegalArgumentException("recordCount must not be negative");
         }
-        if (lastSequence < 0 && recordCount > 0 && !GENESIS_HASH.equals(lastHash)) {
+        if (lastSequence < 0 && !GENESIS_HASH.equals(lastHash)) {
+            // Including a chain that has never been written to. A tip claiming no records while
+            // carrying a record's hash makes the next append link to something that is not there,
+            // and every verification from then on reports BROKEN_LINK at sequence 0.
             throw new IllegalArgumentException(
                     "a tip with no last sequence cannot carry a record's hash");
+        }
+        if (lastSequence >= 0 && recordCount < lastSequence + 1) {
+            // Sequences start at 0 and never skip, and a store moves the record and the tip in one
+            // step, so an honest tip always remembers at least as many records as its sequence
+            // implies. Fewer means the count was lowered, which is how a truncation is hidden.
+            throw new IllegalArgumentException("a tip at sequence " + lastSequence
+                    + " cannot remember only " + recordCount + " records");
         }
     }
 

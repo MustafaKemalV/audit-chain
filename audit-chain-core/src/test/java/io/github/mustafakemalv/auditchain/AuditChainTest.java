@@ -148,6 +148,8 @@ class AuditChainTest {
 
         private final List<ChainedRecord> records = new ArrayList<>();
         private final long highWaterMark;
+        /** Lets a test stage a tip that disagrees with the records, as an attacker's UPDATE would. */
+        Long tipSequenceOverride;
 
         TamperedStore() {
             this(0L);
@@ -171,10 +173,23 @@ class AuditChainTest {
         }
 
         @Override
+        public ChainedRecord appendSealedIndependently(RecordSealer sealer) {
+            // Nothing here takes part in a transaction, so every write is already independent.
+            return appendSealed(sealer);
+        }
+
+        @Override
         public ChainHead head() {
             long mark = Math.max(highWaterMark, records.size());
             if (records.isEmpty()) {
                 return ChainHead.emptyWithHistory(mark);
+            }
+            if (tipSequenceOverride != null) {
+                ChainedRecord at = records.stream()
+                        .filter(r -> r.record().sequence() == tipSequenceOverride)
+                        .findFirst()
+                        .orElse(records.get(records.size() - 1));
+                return new ChainHead(at.record().sequence(), at.hash(), mark);
             }
             ChainedRecord last = records.get(records.size() - 1);
             return new ChainHead(last.record().sequence(), last.hash(), mark);
@@ -272,16 +287,36 @@ class AuditChainTest {
 
     @Test
     void verifyAgainstCheckpointDetectsAChainShorterThanTheAnchor() {
-        // The chain is internally valid but no longer reaches the anchored sequence, which is what
-        // deleting everything above the anchor looks like. Reported as TRUNCATED rather than a
-        // checkpoint mismatch, because the anchor did not disagree with a record: the record is gone.
+        // The anchored sequence is not in the chain, so there is nothing to compare the anchor with.
+        // This used to be answered by a guard that read the stored tip, which meant one UPDATE to the
+        // tip table made an untouched chain report a break that had not happened. Finding the record
+        // itself needs no such trust.
         AuditChain chain = chainOver(storeWithThreeRecords());
         Checkpoint anchor = new Checkpoint(99L, "0".repeat(64));
 
         VerificationResult result = chain.verifyAgainstCheckpoint(anchor);
         assertThat(result.valid()).isFalse();
-        assertThat(result.reason()).isEqualTo(FailureReason.TRUNCATED);
+        assertThat(result.reason()).isEqualTo(FailureReason.CHECKPOINT_MISMATCH);
         assertThat(result.brokenSequence()).isEqualTo(99L);
+    }
+
+    @Test
+    void rewritingTheStoredTipDoesNotMakeAnIntactChainFailItsAnchor() {
+        // The regression the guard above caused: nothing deleted, no record touched, one tip value
+        // changed, and verifyAgainstCheckpoint reported TRUNCATED. SECURITY.md puts "report a break
+        // that did not happen" in scope.
+        InMemoryAuditStore real = storeWithThreeRecords();
+        List<ChainedRecord> records = real.findAll();
+        AuditChain chain = chainOver(real);
+        Checkpoint anchor = chain.head().orElseThrow();
+
+        TamperedStore rewrittenTip = new TamperedStore(records.size());
+        records.forEach(rewrittenTip::append);
+        rewrittenTip.tipSequenceOverride = 0L;   // the tip now claims the chain ends at 0
+
+        assertThat(chainOver(rewrittenTip).verifyAgainstCheckpoint(anchor).valid())
+                .as("the records still agree with the anchor")
+                .isTrue();
     }
 
     @Test
@@ -338,7 +373,7 @@ class AuditChainTest {
         InMemoryAuditStore store = new InMemoryAuditStore();
         ChainedRecord record = chainOver(store).append(AuditEvent.of("alice", "login"));
 
-        assertThat(record.formatVersion()).isEqualTo(CanonicalEncoder.CURRENT_FORMAT_VERSION);
+        assertThat(record.formatVersion()).isEqualTo(CanonicalEncoder.currentFormatVersion());
     }
 
     @Test

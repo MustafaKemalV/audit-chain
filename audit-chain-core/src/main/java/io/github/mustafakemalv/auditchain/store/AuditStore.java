@@ -83,18 +83,17 @@ public interface AuditStore {
     /**
      * Seals and stores one record in a transaction of its own, whatever the caller is doing.
      *
-     * <p>The default delegates to {@link #appendSealed(RecordSealer)}, which is correct for any
-     * store that does not take part in transactions: there, every write is already independent. A
-     * transactional store must override this, or a caller asking for independence will silently not
-     * get it.
+     * <p>Not given a default on purpose. A store that does not take part in transactions can simply
+     * delegate to {@link #appendSealed(RecordSealer)}, since every write there is already
+     * independent, but a transactional store that inherited that delegation would silently fail to
+     * provide the independence its caller asked for, and {@code audit-chain.on-failure=LOG} would do
+     * precisely what it exists to prevent.
      *
      * @param sealer turns the current tip into the record to append
      * @return the record that was stored
      * @throws AuditStoreException if the store cannot be reached or rejects the write
      */
-    default ChainedRecord appendSealedIndependently(RecordSealer sealer) {
-        return appendSealed(sealer);
-    }
+    ChainedRecord appendSealedIndependently(RecordSealer sealer);
 
     /**
      * The tip of the chain: where the next record attaches, and how many records have ever been
@@ -124,9 +123,10 @@ public interface AuditStore {
     /**
      * Number of records currently stored.
      *
-     * <p>This counts what is actually there, unlike {@link ChainHead#recordCount()}, which remembers
-     * what there has ever been. Verification compares the two, so a store must not answer this from
-     * the same remembered value.
+     * <p>This counts the rows the store actually holds, unlike {@link ChainHead#recordCount()},
+     * which remembers how many the chain has ever had. Verification compares this against the
+     * records it walked, so rows outside the chain, at a negative sequence or above the tip, are
+     * noticed rather than ignored. A store must not answer this from the remembered value.
      *
      * @return how many records the store holds
      * @throws AuditStoreException if the store cannot be reached
@@ -136,20 +136,29 @@ public interface AuditStore {
     /**
      * The most recently appended record, or empty if the chain has none.
      *
-     * <p>Derived from {@link #head()} and {@link #findRange(long, int)} so it cannot disagree with
-     * them. Override only to save a round trip.
+     * <p>Must be the highest-sequence record actually present, found independently of the stored
+     * tip. Taking the position from the tip would let anyone able to write it choose which record an
+     * anchoring job exports: rewind the tip, let the job anchor that older record, then delete
+     * everything above it, and both verifications pass.
+     *
+     * <p>The default walks the chain, which is correct but reads everything. A store that can ask
+     * its backend for the highest sequence directly should override this.
      *
      * @return the newest record, or empty
      * @throws AuditStoreException if the store cannot be reached
      * @throws MalformedRecordException if the stored record cannot be read back
      */
     default Optional<ChainedRecord> last() {
-        ChainHead head = head();
-        if (head.isEmpty()) {
-            return Optional.empty();
+        ChainedRecord newest = null;
+        long from = 0L;
+        while (true) {
+            List<ChainedRecord> page = findRange(from, 1000);
+            if (page.isEmpty()) {
+                return Optional.ofNullable(newest);
+            }
+            newest = page.get(page.size() - 1);
+            from = newest.record().sequence() + 1;
         }
-        List<ChainedRecord> found = findRange(head.lastSequence(), 1);
-        return found.isEmpty() ? Optional.empty() : Optional.of(found.get(0));
     }
 
     /**

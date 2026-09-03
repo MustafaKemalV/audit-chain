@@ -153,7 +153,7 @@ public final class AuditChain {
         Instant timestamp = clock.instant(); // AuditRecord truncates to millis
         AuditRecord record = new AuditRecord(sequence, timestamp, event.actor(), event.action(),
                 event.resourceType(), event.resourceId(), event.details());
-        int formatVersion = CanonicalEncoder.CURRENT_FORMAT_VERSION;
+        int formatVersion = CanonicalEncoder.currentFormatVersion();
         String hash = computeHash(record, previousHash, formatVersion);
         return new ChainedRecord(record, previousHash, hash, formatVersion);
     }
@@ -253,6 +253,13 @@ public final class AuditChain {
             // sources contradicting each other is free to detect and says more than either alone.
             return VerificationResult.broken(0L, FailureReason.CHAIN_HEAD_MISMATCH);
         }
+        if (store.count() > seen) {
+            // The walk covers sequences from 0 upwards, so rows the store holds but the walk never
+            // reached are sitting outside the chain: a negative sequence, or one inserted above the
+            // tip. They attest to nothing and no link covers them, so an intact verdict would be
+            // saying more than the chain can support.
+            return VerificationResult.broken(seen, FailureReason.CHAIN_HEAD_MISMATCH);
+        }
         return VerificationResult.intact();
     }
 
@@ -293,7 +300,13 @@ public final class AuditChain {
         // anyone who can write to it choose what gets anchored: set the tip back, let the anchoring
         // job export that, then delete everything above it, and both verifications pass. An anchor
         // is only worth what its source is worth.
-        return store.last().map(record -> new Checkpoint(record.record().sequence(), record.hash()));
+        try {
+            return store.last().map(record -> new Checkpoint(record.record().sequence(), record.hash()));
+        } catch (MalformedRecordException e) {
+            // A corrupt newest record must not crash the anchoring job. Returning empty says "there
+            // is nothing safe to anchor", and verify() is where that corruption gets reported.
+            return Optional.empty();
+        }
     }
 
     /**
@@ -319,16 +332,11 @@ public final class AuditChain {
         // A checkpoint pins one point, so on its own it says nothing about what came after it. A
         // chain that no longer reaches the anchored sequence has lost everything above it, which is
         // exactly the deletion an anchor is supposed to make visible.
-        ChainHead head;
-        try {
-            head = store.head();
-        } catch (MalformedRecordException e) {
-            return VerificationResult.broken(0L, FailureReason.CHAIN_HEAD_MISMATCH);
-        }
-        if (head.lastSequence() < checkpoint.sequence()) {
-            return VerificationResult.broken(checkpoint.sequence(), FailureReason.TRUNCATED);
-        }
-
+        // No reach check against the stored tip here. It read the one value an attacker with UPDATE
+        // on the tip table can change, so a single edit made an untouched chain report TRUNCATED,
+        // which SECURITY.md puts in scope as a break that did not happen. It was also redundant: a
+        // chain that no longer reaches the anchor fails the lookup below, and one that lost records
+        // above it is caught by verify()'s record count.
         List<ChainedRecord> anchored;
         try {
             anchored = store.findRange(checkpoint.sequence(), 1);

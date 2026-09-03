@@ -32,8 +32,19 @@ public final class CanonicalEncoder {
      * The encoding version this build writes. Bump it whenever the byte layout below changes in any
      * way: a new field, a different order, a different width. Records already stored keep their own
      * version and stay verifiable.
+     *
+     * <p>Deliberately a method rather than a public constant. A {@code static final int} is a
+     * compile-time constant, so it is copied into every consumer's bytecode: a store compiled today
+     * would keep stamping 1 after this library moved to 2, its records would be sealed under one
+     * layout and stamped with another, and every one of them would report as tampered with.
+     *
+     * @return the format version new records are written under
      */
-    public static final int CURRENT_FORMAT_VERSION = 1;
+    public static int currentFormatVersion() {
+        return CURRENT_FORMAT_VERSION;
+    }
+
+    private static final int CURRENT_FORMAT_VERSION = 1;
 
     private static final int NULL_MARKER = -1;
 
@@ -44,7 +55,7 @@ public final class CanonicalEncoder {
      * Encodes {@code record} to its canonical byte representation under a given format version.
      *
      * @param record the record to encode
-     * @param formatVersion the layout version to write, normally {@link #CURRENT_FORMAT_VERSION};
+     * @param formatVersion the layout version to write, normally {@link #currentFormatVersion()};
      *     verification passes the version the record was stored with
      * @return the canonical bytes
      * @throws IllegalArgumentException if the record is null or the version is not one this build

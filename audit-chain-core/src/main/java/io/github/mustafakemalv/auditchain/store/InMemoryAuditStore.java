@@ -4,6 +4,7 @@ import io.github.mustafakemalv.auditchain.core.ChainHead;
 import io.github.mustafakemalv.auditchain.core.ChainedRecord;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
 
 /**
  * In-memory {@link AuditStore}, kept in an {@code ArrayList} guarded by this object's monitor.
@@ -64,7 +65,10 @@ public class InMemoryAuditStore implements AuditStore {
                     "sequence " + sequence + " is not above the current head; the chain would fork");
         }
         records.add(record);
-        highWaterMark++;
+        // The sequence reached, not the rows inserted: a tip must never remember fewer records than
+        // its own sequence implies, and a staged chain with a gap in it would otherwise do exactly
+        // that.
+        highWaterMark = Math.max(highWaterMark, sequence + 1);
     }
 
     /**
@@ -76,12 +80,30 @@ public class InMemoryAuditStore implements AuditStore {
     }
 
     @Override
+    public synchronized ChainedRecord appendSealedIndependently(RecordSealer sealer) {
+        // Nothing here takes part in a transaction, so every write is already independent.
+        return appendSealed(sealer);
+    }
+
+    @Override
     public synchronized ChainHead head() {
         if (records.isEmpty()) {
             return ChainHead.emptyWithHistory(highWaterMark);
         }
         ChainedRecord last = records.get(records.size() - 1);
-        return new ChainHead(last.record().sequence(), last.hash(), highWaterMark);
+        try {
+            return new ChainHead(last.record().sequence(), last.hash(), highWaterMark);
+        } catch (IllegalArgumentException e) {
+            // A record staged through append() can carry anything, including a hash that is not one.
+            // The SPI requires stored data that will not read back to surface as a malformed record,
+            // so that verification reports it rather than throwing at whoever asked.
+            throw new MalformedRecordException("the newest record does not describe a chain tip", e);
+        }
+    }
+
+    @Override
+    public synchronized Optional<ChainedRecord> last() {
+        return records.isEmpty() ? Optional.empty() : Optional.of(records.get(records.size() - 1));
     }
 
     @Override

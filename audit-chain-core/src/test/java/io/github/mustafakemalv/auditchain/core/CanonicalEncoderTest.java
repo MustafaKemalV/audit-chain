@@ -13,7 +13,7 @@ import org.junit.jupiter.api.Test;
 class CanonicalEncoderTest {
 
     private static byte[] encode(AuditRecord record) {
-        return CanonicalEncoder.encode(record, CanonicalEncoder.CURRENT_FORMAT_VERSION);
+        return CanonicalEncoder.encode(record, CanonicalEncoder.currentFormatVersion());
     }
 
     private static AuditRecord record(String actor, String action, String resourceType,
@@ -129,7 +129,7 @@ class CanonicalEncoderTest {
         assertThatThrownBy(() -> CanonicalEncoder.encode(record, 2))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("unsupported format version");
-        assertThatThrownBy(() -> CanonicalEncoder.encode(null, CanonicalEncoder.CURRENT_FORMAT_VERSION))
+        assertThatThrownBy(() -> CanonicalEncoder.encode(null, CanonicalEncoder.currentFormatVersion()))
                 .isInstanceOf(IllegalArgumentException.class);
     }
 }

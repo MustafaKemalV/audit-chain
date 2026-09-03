@@ -31,6 +31,9 @@ import org.junit.jupiter.api.Test;
 import javax.sql.DataSource;
 import org.springframework.jdbc.core.PreparedStatementCreator;
 import org.springframework.jdbc.core.RowMapper;
+import java.sql.Connection;
+import java.sql.SQLException;
+import org.springframework.jdbc.datasource.DelegatingDataSource;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.embedded.EmbeddedDatabase;
 import org.springframework.jdbc.datasource.embedded.EmbeddedDatabaseBuilder;
@@ -549,6 +552,48 @@ class JdbcAuditStoreTest {
         public <T> List<T> query(PreparedStatementCreator psc, RowMapper<T> rowMapper) {
             queries++;
             return super.query(psc, rowMapper);
+        }
+    }
+
+    @Test
+    void aFailureCreatingTheTipRowDoesNotDisableItForever() {
+        // Swallowing this and marking the row present left the store locking nothing for the rest of
+        // its life, so a single transient failure at startup cost records to the primary key while
+        // verify() still reported the chain intact. One lock timeout must not be permanent.
+        jdbcTemplate.update("DELETE FROM audit_chain_head");
+        JdbcAuditStore store = new JdbcAuditStore(new JdbcTemplate(new FailOnceDataSource(database)),
+                "audit_chain", JdbcAuditStore.DEFAULT_HEAD_TABLE,
+                new DataSourceTransactionManager(database));
+        AuditChain chain = new AuditChain(KEY, store, "audit_chain");
+
+        assertThatThrownBy(() -> chain.append(AuditEvent.of("alice", "first")))
+                .as("the failure is reported, not swallowed")
+                .isInstanceOf(AuditStoreException.class);
+
+        chain.append(AuditEvent.of("alice", "second"));
+
+        assertThat(store.count()).as("the next append recovers").isEqualTo(1L);
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM audit_chain_head WHERE chain_table = 'audit_chain'", Long.class))
+                .as("the tip row really exists now").isEqualTo(1L);
+    }
+
+    /** Fails the first connection request, then behaves, standing in for a transient outage. */
+    static class FailOnceDataSource extends DelegatingDataSource {
+
+        private boolean failed;
+
+        FailOnceDataSource(DataSource target) {
+            super(target);
+        }
+
+        @Override
+        public Connection getConnection() throws SQLException {
+            if (!failed) {
+                failed = true;
+                throw new SQLException("transient outage");
+            }
+            return super.getConnection();
         }
     }
 }

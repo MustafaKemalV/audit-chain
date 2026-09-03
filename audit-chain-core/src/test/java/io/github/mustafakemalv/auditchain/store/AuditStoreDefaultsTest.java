@@ -55,6 +55,12 @@ class AuditStoreDefaultsTest {
         }
 
         @Override
+        public synchronized ChainedRecord appendSealedIndependently(RecordSealer sealer) {
+            // Nothing here takes part in a transaction, so every write is already independent.
+            return appendSealed(sealer);
+        }
+
+        @Override
         public synchronized ChainHead head() {
             if (records.isEmpty()) {
                 return ChainHead.emptyWithHistory(everStored);
