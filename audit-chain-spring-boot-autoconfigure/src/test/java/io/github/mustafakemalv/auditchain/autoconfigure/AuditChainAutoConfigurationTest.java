@@ -7,9 +7,12 @@ import io.github.mustafakemalv.auditchain.store.AuditStore;
 import io.github.mustafakemalv.auditchain.store.InMemoryAuditStore;
 import io.github.mustafakemalv.auditchain.store.jdbc.JdbcAuditStore;
 import java.util.Base64;
+import java.util.List;
 import javax.sql.DataSource;
 import org.junit.jupiter.api.Test;
+import org.springframework.boot.autoconfigure.AutoConfiguration;
 import org.springframework.boot.autoconfigure.AutoConfigurations;
+import org.springframework.boot.context.annotation.ImportCandidates;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -173,5 +176,18 @@ class AuditChainAutoConfigurationTest {
                 .generateUniqueName(true)
                 .addScript("classpath:audit-chain/schema.sql")
                 .build();
+    }
+
+    @Test
+    void theAutoConfigurationIsActuallyRegistered() {
+        // Every other test in this class hands the configuration class to the runner by name, so all
+        // of them would still pass if the registration file were deleted, while the starter silently
+        // did nothing in every real application. This is the one test that reads the file Spring Boot
+        // actually looks at.
+        List<String> registered = ImportCandidates
+                .load(AutoConfiguration.class, getClass().getClassLoader())
+                .getCandidates();
+
+        assertThat(registered).contains(AuditChainAutoConfiguration.class.getName());
     }
 }
